@@ -48,8 +48,6 @@ int main(int argc, char **argv) {
   opts.num_threads = 1;
   ParseCommandLine(argc, argv, opts);
 
-  omp_set_num_threads(opts.num_threads);
-
   CompactHashTable kraken_index(opts.hashtable_filename);
   Taxonomy taxonomy(opts.taxonomy_filename);
   IndexOptions idx_opts = {0};

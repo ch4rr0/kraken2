@@ -15,6 +15,7 @@
 #include "reports.h"
 #include "utilities.h"
 #include "readcounts.h"
+#include "threadpool.h"
 using namespace kraken2;
 
 using std::cout;
@@ -59,9 +60,9 @@ struct Options {
 };
 
 struct ClassificationStats {
-  uint64_t total_sequences;
-  uint64_t total_bases;
-  uint64_t total_classified;
+  std::atomic<uint64_t> total_sequences;
+  std::atomic<uint64_t> total_bases;
+  std::atomic<uint64_t> total_classified;
 };
 
 struct OutputStreamData {
@@ -88,7 +89,8 @@ void usage(int exit_code=EX_USAGE);
 void ProcessFiles(const char *filename1, const char *filename2,
     KeyValueStore *hash, Taxonomy &tax,
     IndexOptions &idx_opts, Options &opts, ClassificationStats &stats,
-    OutputStreamData &outputs, taxon_counters_t &total_taxon_counters);
+                  OutputStreamData &outputs, taxon_counters_t &total_taxon_counters,
+                  thread_pool& pool);
 taxid_t ClassifySequence(Sequence &dna, Sequence &dna2, ostringstream &koss,
     KeyValueStore *hash, Taxonomy &tax, IndexOptions &idx_opts,
     Options &opts, ClassificationStats &stats, MinimizerScanner &scanner,
@@ -122,7 +124,7 @@ int main(int argc, char **argv) {
   taxon_counters_t taxon_counters; // stats per taxon
   ParseCommandLine(argc, argv, opts);
 
-  omp_set_num_threads(opts.num_threads);
+  thread_pool pool(opts.num_threads);
 
   cerr << "Loading database information...";
 
@@ -140,7 +142,10 @@ int main(int argc, char **argv) {
 
   cerr << " done." << endl;
 
-  ClassificationStats stats = {0, 0, 0};
+  ClassificationStats stats;
+  stats.total_sequences = 0;
+  stats.total_bases = 0;
+  stats.total_classified = 0;
 
   OutputStreamData outputs = { false, false, nullptr, nullptr, nullptr, nullptr, &std::cout };
 
@@ -149,7 +154,7 @@ int main(int argc, char **argv) {
   if (optind == argc) {
     if (opts.paired_end_processing && ! opts.single_file_pairs)
       errx(EX_USAGE, "paired end processing used with no files specified");
-    ProcessFiles(nullptr, nullptr, hash_ptr, taxonomy, idx_opts, opts, stats, outputs, taxon_counters);
+    ProcessFiles(nullptr, nullptr, hash_ptr, taxonomy, idx_opts, opts, stats, outputs, taxon_counters, pool);
   }
   else {
     for (int i = optind; i < argc; i++) {
@@ -157,11 +162,11 @@ int main(int argc, char **argv) {
         if (i + 1 == argc) {
           errx(EX_USAGE, "paired end processing used with unpaired file");
         }
-        ProcessFiles(argv[i], argv[i+1], hash_ptr, taxonomy, idx_opts, opts, stats, outputs, taxon_counters);
+        ProcessFiles(argv[i], argv[i+1], hash_ptr, taxonomy, idx_opts, opts, stats, outputs, taxon_counters, pool);
         i += 1;
       }
       else {
-        ProcessFiles(argv[i], nullptr, hash_ptr, taxonomy, idx_opts, opts, stats, outputs, taxon_counters);
+        ProcessFiles(argv[i], nullptr, hash_ptr, taxonomy, idx_opts, opts, stats, outputs, taxon_counters, pool);
       }
     }
   }
@@ -219,10 +224,11 @@ void ReportStats(struct timeval time1, struct timeval time2,
 }
 
 void ProcessFiles(const char *filename1, const char *filename2,
-    KeyValueStore *hash, Taxonomy &tax,
-    IndexOptions &idx_opts, Options &opts, ClassificationStats &stats,
-    OutputStreamData &outputs,
-    taxon_counters_t &total_taxon_counters)
+                  KeyValueStore *hash, Taxonomy &tax,
+                  IndexOptions &idx_opts, Options &opts, ClassificationStats &stats,
+                  OutputStreamData &outputs,
+                  taxon_counters_t &total_taxon_counters,
+                  thread_pool& pool)
 {
   std::istream *fptr1 = nullptr, *fptr2 = nullptr;
 
@@ -240,181 +246,186 @@ void ProcessFiles(const char *filename1, const char *filename2,
   auto comparator = [](const OutputData &a, const OutputData &b) {
     return a.block_id > b.block_id;
   };
+  std::vector<std::future<void>> results;
   std::priority_queue<OutputData, vector<OutputData>, decltype(comparator)>
     output_queue(comparator);
-  uint64_t next_input_block_id = 0;
-  uint64_t next_output_block_id = 0;
-  omp_lock_t output_lock;
-  omp_init_lock(&output_lock);
+  std::atomic<uint64_t> next_input_block_id{0};
+  std::atomic<uint64_t> next_output_block_id{0};
+  std::mutex output_lock;
+  std::mutex m1, m2, m3, m4, m5;
 
-  #pragma omp parallel
-  {
-    MinimizerScanner scanner(idx_opts.k, idx_opts.l, idx_opts.spaced_seed_mask,
-                             idx_opts.dna_db, idx_opts.toggle_mask,
-                             idx_opts.revcom_version);
-    vector<taxid_t> taxa;
-    taxon_counts_t hit_counts;
-    ostringstream kraken_oss, c1_oss, c2_oss, u1_oss, u2_oss;
-    ClassificationStats thread_stats = {0, 0, 0};
-    vector<string> translated_frames(6);
-    BatchSequenceReader reader1, reader2;
-    Sequence seq1, seq2;
-    uint64_t block_id;
-    OutputData out_data;
-    taxon_counters_t thread_taxon_counters;
-
-    while (true) {
-      thread_stats.total_sequences = 0;
+  for (int i = 0; i < pool.size(); i++)
+    results.emplace_back(pool.submit([&] {
+      MinimizerScanner scanner(idx_opts.k, idx_opts.l, idx_opts.spaced_seed_mask,
+                               idx_opts.dna_db, idx_opts.toggle_mask,
+                               idx_opts.revcom_version);
+      vector<taxid_t> taxa;
+      taxon_counts_t hit_counts;
+      ostringstream kraken_oss, c1_oss, c2_oss, u1_oss, u2_oss;
+      ClassificationStats thread_stats;
       thread_stats.total_bases = 0;
+      thread_stats.total_sequences = 0;
       thread_stats.total_classified = 0;
-
-      auto ok_read = false;
-
-      #pragma omp critical(seqread)
-      {  // Input processing block
-        if (! opts.paired_end_processing) {
-          // Unpaired data?  Just read in a sized block
-          ok_read = reader1.LoadBlock(*fptr1, (size_t)(3 * 1024 * 1024));
-        }
-        else if (! opts.single_file_pairs) {
-          // Paired data in 2 files?  Read a line-counted batch from each file.
-          ok_read = reader1.LoadBatch(*fptr1, NUM_FRAGMENTS_PER_THREAD);
-          if (ok_read && opts.paired_end_processing)
-            ok_read = reader2.LoadBatch(*fptr2, NUM_FRAGMENTS_PER_THREAD);
-        }
-        else {
-          auto frags = NUM_FRAGMENTS_PER_THREAD * 2;
-          // Ensure frag count is even - just in case above line is changed
-          if (frags % 2 == 1)
-            frags++;
-          ok_read = reader1.LoadBatch(*fptr1, frags);
-        }
-        block_id = next_input_block_id++;
-      }
-
-      if (! ok_read)
-        break;
-
-      // Reset all dynamically-growing things
-      kraken_oss.str("");
-      c1_oss.str("");
-      c2_oss.str("");
-      u1_oss.str("");
-      u2_oss.str("");
-      thread_taxon_counters.clear();
+      vector<string> translated_frames(6);
+      BatchSequenceReader reader1, reader2;
+      Sequence seq1, seq2;
+      uint64_t block_id;
+      OutputData out_data;
+      taxon_counters_t thread_taxon_counters;
 
       while (true) {
-        auto valid_fragment = reader1.NextSequence(seq1);
-        if (opts.paired_end_processing && valid_fragment) {
-          if (opts.single_file_pairs)
-            valid_fragment = reader1.NextSequence(seq2);
-          else
-            valid_fragment = reader2.NextSequence(seq2);
-        }
-        if (! valid_fragment)
-          break;
-        thread_stats.total_sequences++;
-        if (opts.minimum_quality_score > 0) {
-          MaskLowQualityBases(seq1, opts.minimum_quality_score);
-          if (opts.paired_end_processing)
-            MaskLowQualityBases(seq2, opts.minimum_quality_score);
-        }
-        auto call = ClassifySequence(seq1, seq2,
-            kraken_oss, hash, tax, idx_opts, opts, thread_stats, scanner,
-            taxa, hit_counts, translated_frames, thread_taxon_counters);
-        if (call) {
-          char buffer[1024] = "";
-          sprintf(buffer, " kraken:taxid|%llu",
-              (unsigned long long) tax.nodes()[call].external_id);
-          seq1.header += buffer;
-          c1_oss << seq1.to_string();
-          if (opts.paired_end_processing) {
-            seq2.header += buffer;
-            c2_oss << seq2.to_string();
+        thread_stats.total_sequences = 0;
+        thread_stats.total_bases = 0;
+        thread_stats.total_classified = 0;
+
+        auto ok_read = false;
+
+        {  // Input processing block
+          std::lock_guard<std::mutex> lock(m1);
+          if (! opts.paired_end_processing) {
+            // Unpaired data?  Just read in a sized block
+            ok_read = reader1.LoadBlock(*fptr1, (size_t)(3 * 1024 * 1024));
           }
+          else if (! opts.single_file_pairs) {
+            // Paired data in 2 files?  Read a line-counted batch from each file.
+            ok_read = reader1.LoadBatch(*fptr1, NUM_FRAGMENTS_PER_THREAD);
+            cout << "Ok read is: " << ok_read;
+            if (ok_read && opts.paired_end_processing)
+              ok_read = reader2.LoadBatch(*fptr2, NUM_FRAGMENTS_PER_THREAD);
+          }
+          else {
+            auto frags = NUM_FRAGMENTS_PER_THREAD * 2;
+            // Ensure frag count is even - just in case above line is changed
+            if (frags % 2 == 1)
+              frags++;
+            ok_read = reader1.LoadBatch(*fptr1, frags);
+          }
+          block_id = next_input_block_id++;
         }
-        else {
-          u1_oss << seq1.to_string();
-          if (opts.paired_end_processing)
-            u2_oss << seq2.to_string();
-        }
-        thread_stats.total_bases += seq1.seq.size();
-        if (opts.paired_end_processing)
-          thread_stats.total_bases += seq2.seq.size();
-      }
 
-      #pragma omp atomic
-      stats.total_sequences += thread_stats.total_sequences;
-      #pragma omp atomic
-      stats.total_bases += thread_stats.total_bases;
-      #pragma omp atomic
-      stats.total_classified += thread_stats.total_classified;
+        if (! ok_read)
+          break;
 
-      #pragma omp critical(output_stats)
-      {
-        if (isatty(fileno(stderr)))
-          cerr << "\rProcessed " << stats.total_sequences
-               << " sequences (" << stats.total_bases << " bp) ...";
-      }
+        // Reset all dynamically-growing things
+        kraken_oss.str("");
+        c1_oss.str("");
+        c2_oss.str("");
+        u1_oss.str("");
+        u2_oss.str("");
+        thread_taxon_counters.clear();
 
-      if (! outputs.initialized) {
-        InitializeOutputs(opts, outputs, reader1.file_format());
-      }
-
-      out_data.block_id = block_id;
-      out_data.kraken_str.assign(kraken_oss.str());
-      out_data.classified_out1_str.assign(c1_oss.str());
-      out_data.classified_out2_str.assign(c2_oss.str());
-      out_data.unclassified_out1_str.assign(u1_oss.str());
-      out_data.unclassified_out2_str.assign(u2_oss.str());
-
-      #pragma omp critical(output_queue)
-      {
-        output_queue.push(out_data);
-      }
-
-      #pragma omp critical(update_taxon_counters)
-      {
-        for (auto &kv_pair : thread_taxon_counters) {
-          total_taxon_counters[kv_pair.first] += std::move(kv_pair.second);
-        }
-      }
-
-      bool output_loop = true;
-      while (output_loop) {
-        #pragma omp critical(output_queue)
-        {
-          output_loop = ! output_queue.empty();
-          if (output_loop) {
-            out_data = output_queue.top();
-            if (out_data.block_id == next_output_block_id) {
-              output_queue.pop();
-              // Acquiring output lock obligates thread to print out
-              // next output data block, contained in out_data
-              omp_set_lock(&output_lock);
-              next_output_block_id++;
-            }
+        while (true) {
+          auto valid_fragment = reader1.NextSequence(seq1);
+          if (opts.paired_end_processing && valid_fragment) {
+            if (opts.single_file_pairs)
+              valid_fragment = reader1.NextSequence(seq2);
             else
-              output_loop = false;
+              valid_fragment = reader2.NextSequence(seq2);
+          }
+          if (! valid_fragment)
+            break;
+          thread_stats.total_sequences++;
+          if (opts.minimum_quality_score > 0) {
+            MaskLowQualityBases(seq1, opts.minimum_quality_score);
+            if (opts.paired_end_processing)
+              MaskLowQualityBases(seq2, opts.minimum_quality_score);
+          }
+          auto call = ClassifySequence(seq1, seq2,
+                                       kraken_oss, hash, tax, idx_opts, opts, thread_stats, scanner,
+                                       taxa, hit_counts, translated_frames, thread_taxon_counters);
+          if (call) {
+            char buffer[1024] = "";
+            sprintf(buffer, " kraken:taxid|%llu",
+                    (unsigned long long) tax.nodes()[call].external_id);
+            seq1.header += buffer;
+            c1_oss << seq1.to_string();
+            if (opts.paired_end_processing) {
+              seq2.header += buffer;
+              c2_oss << seq2.to_string();
+            }
+          }
+          else {
+            u1_oss << seq1.to_string();
+            if (opts.paired_end_processing)
+              u2_oss << seq2.to_string();
+          }
+          thread_stats.total_bases += seq1.seq.size();
+          if (opts.paired_end_processing)
+            thread_stats.total_bases += seq2.seq.size();
+        }
+
+        cout << "thread stats: " << thread_stats.total_sequences;
+        stats.total_sequences += thread_stats.total_sequences;
+        stats.total_bases += thread_stats.total_bases;
+        stats.total_classified += thread_stats.total_classified;
+
+        {
+          std::lock_guard<std::mutex> lock(m2);
+          if (isatty(fileno(stderr)))
+            cerr << "\rProcessed " << stats.total_sequences
+                 << " sequences (" << stats.total_bases << " bp) ...";
+        }
+
+        if (! outputs.initialized) {
+          std::lock_guard<std::mutex> lock(m2);
+          InitializeOutputs(opts, outputs, reader1.file_format());
+        }
+
+        out_data.block_id = block_id;
+        out_data.kraken_str.assign(kraken_oss.str());
+        out_data.classified_out1_str.assign(c1_oss.str());
+        out_data.classified_out2_str.assign(c2_oss.str());
+        out_data.unclassified_out1_str.assign(u1_oss.str());
+        out_data.unclassified_out2_str.assign(u2_oss.str());
+
+        {
+          std::lock_guard<std::mutex> lock(m3);
+          output_queue.push(out_data);
+        }
+
+        {
+          std::lock_guard<std::mutex> lock(m4);
+          for (auto &kv_pair : thread_taxon_counters) {
+            total_taxon_counters[kv_pair.first] += std::move(kv_pair.second);
           }
         }
-        if (! output_loop)
-          break;
-        if (outputs.kraken_output != nullptr)
-          (*outputs.kraken_output) << out_data.kraken_str;
-        if (outputs.classified_output1 != nullptr)
-          (*outputs.classified_output1) << out_data.classified_out1_str;
-        if (outputs.classified_output2 != nullptr)
-          (*outputs.classified_output2) << out_data.classified_out2_str;
-        if (outputs.unclassified_output1 != nullptr)
-          (*outputs.unclassified_output1) << out_data.unclassified_out1_str;
-        if (outputs.unclassified_output2 != nullptr)
-          (*outputs.unclassified_output2) << out_data.unclassified_out2_str;
-        omp_unset_lock(&output_lock);
-      }  // end while output loop
-    }  // end while
-  }  // end parallel block
-  omp_destroy_lock(&output_lock);
+
+        bool output_loop = true;
+        while (output_loop) {
+          {
+            std::lock_guard<std::mutex> lock(m5);
+            output_loop = ! output_queue.empty();
+            if (output_loop) {
+              out_data = output_queue.top();
+              if (out_data.block_id == next_output_block_id) {
+                output_queue.pop();
+                // Acquiring output lock obligates thread to print out
+                // next output data block, contained in out_data
+                // omp_set_lock(&output_lock);
+                next_output_block_id++;
+              }
+              else
+                output_loop = false;
+            }
+          }
+          if (! output_loop)
+            break;
+          if (outputs.kraken_output != nullptr)
+            (*outputs.kraken_output) << out_data.kraken_str;
+          if (outputs.classified_output1 != nullptr)
+            (*outputs.classified_output1) << out_data.classified_out1_str;
+          if (outputs.classified_output2 != nullptr)
+            (*outputs.classified_output2) << out_data.classified_out2_str;
+          if (outputs.unclassified_output1 != nullptr)
+            (*outputs.unclassified_output1) << out_data.unclassified_out1_str;
+          if (outputs.unclassified_output2 != nullptr)
+            (*outputs.unclassified_output2) << out_data.unclassified_out2_str;
+          // omp_unset_lock(&output_lock);
+        }  // end while output loop
+      }  // end while
+    }));  // end parallel block
+  for (size_t i = 0; i < results.size(); i++)
+    results[i].get();
   if (fptr1 != nullptr)
     delete fptr1;
   if (fptr2 != nullptr)
@@ -429,7 +440,7 @@ void ProcessFiles(const char *filename1, const char *filename2,
     (*outputs.unclassified_output1) << std::flush;
   if (outputs.unclassified_output2 != nullptr)
     (*outputs.unclassified_output2) << std::flush;
-}
+} 
 
 taxid_t ResolveTree(taxon_counts_t &hit_counts,
     Taxonomy &taxonomy, size_t total_minimizers, Options &opts)
@@ -673,8 +684,6 @@ void AddHitlistString(ostringstream &oss, vector<taxid_t> &taxa,
 }
 
 void InitializeOutputs(Options &opts, OutputStreamData &outputs, SequenceFormat format) {
-  #pragma omp critical(output_init)
-  {
     if (! outputs.initialized) {
       if (! opts.classified_output_filename.empty()) {
         if (opts.paired_end_processing) {
@@ -720,7 +729,6 @@ void InitializeOutputs(Options &opts, OutputStreamData &outputs, SequenceFormat 
       }
       outputs.initialized = true;
     }
-  }
 }
 
 void MaskLowQualityBases(Sequence &dna, int minimum_quality_score) {

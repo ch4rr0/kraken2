@@ -1,3 +1,4 @@
+#include <atomic>
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
@@ -27,7 +28,8 @@
 #include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
-#include "omp_hack.h"
+#include <mutex>
+#include <future>
 
 #ifndef SIZE_MAX
 #define SIZE_MAX ((size_t) -1)

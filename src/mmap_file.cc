@@ -64,37 +64,37 @@ void MMapFile::OpenFile(const char *filename, int mode, int prot_flags,
 // Basically a cat operation, loads file into OS cache
 // I don't use MAP_POPULATE to do this because of portability issues
 void MMapFile::LoadFile() {
-  int thread_ct = 1;
-  int thread = 0;
-  #ifdef _OPENMP
-  int old_thread_ct = omp_get_max_threads();
-  // Don't use more than 4 threads, don't want to hammer disk
-  if (old_thread_ct > 4)
-    omp_set_num_threads(4);
-  thread_ct = omp_get_max_threads();
-  #endif
+  // int thread_ct = 1;
+  // int thread = 0;
+  // #ifdef _OPENMP
+  // int old_thread_ct = omp_get_max_threads();
+  // // Don't use more than 4 threads, don't want to hammer disk
+  // if (old_thread_ct > 4)
+  //   omp_set_num_threads(4);
+  // thread_ct = omp_get_max_threads();
+  // #endif
 
-  size_t page_size = getpagesize();
-  char buf[thread_ct][page_size];
+  // size_t page_size = getpagesize();
+  // char buf[thread_ct][page_size];
 
-  #pragma omp parallel
-  {
-    #ifdef _OPENMP
-    thread = omp_get_thread_num();
-    #endif
+  // #pragma omp parallel
+  // {
+  //   #ifdef _OPENMP
+  //   thread = omp_get_thread_num();
+  //   #endif
 
-    #pragma omp for schedule(dynamic)
-    for (size_t pos = 0; pos < filesize_; pos += page_size) {
-      size_t this_page_size = filesize_ - pos;
-      if (this_page_size > page_size)
-        this_page_size = page_size;
-      memcpy(buf[thread], fptr_ + pos, this_page_size);
-    }
-  }
+  //   #pragma omp for schedule(dynamic)
+  //   for (size_t pos = 0; pos < filesize_; pos += page_size) {
+  //     size_t this_page_size = filesize_ - pos;
+  //     if (this_page_size > page_size)
+  //       this_page_size = page_size;
+  //     memcpy(buf[thread], fptr_ + pos, this_page_size);
+  //   }
+  // }
 
-  #ifdef _OPENMP
-  omp_set_num_threads(old_thread_ct);
-  #endif
+  // #ifdef _OPENMP
+  // omp_set_num_threads(old_thread_ct);
+  // #endif
 }
 
 char * MMapFile::fptr() {

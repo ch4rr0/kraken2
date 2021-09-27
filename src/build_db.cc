@@ -12,6 +12,7 @@
 #include "kv_store.h"
 #include "kraken2_data.h"
 #include "utilities.h"
+#include "threadpool.h"
 
 using std::string;
 using std::map;
@@ -57,13 +58,15 @@ void ProcessSequenceFast(const string &seq, taxid_t taxid,
     CompactHashTable &hash, const Taxonomy &tax, MinimizerScanner &scanner,
     uint64_t min_clear_hash_value);
 void ProcessSequence(const Options &opts, const string &seq, taxid_t taxid,
-    CompactHashTable &hash, const Taxonomy &tax);
+                     CompactHashTable &hash, const Taxonomy &tax, thread_pool &pool);
 void ProcessSequencesFast(const Options &opts,
-    const map<string, taxid_t> &ID_to_taxon_map,
-    CompactHashTable &kraken_index, const Taxonomy &taxonomy);
+                          const map<string, taxid_t> &ID_to_taxon_map,
+                          CompactHashTable &kraken_index, const Taxonomy &taxonomy,
+                          thread_pool &pool);
 void ProcessSequences(const Options &opts,
-    const map<string, taxid_t> &ID_to_taxon_map,
-    CompactHashTable &kraken_index, const Taxonomy &taxonomy);
+                      const map<string, taxid_t> &ID_to_taxon_map,
+                      CompactHashTable &kraken_index, const Taxonomy &taxonomy,
+                      thread_pool &pool);
 void SetMinimizerLCA(CompactHashTable &hash, uint64_t minimizer, taxid_t taxid,
     const Taxonomy &tax);
 void ReadIDToTaxonMap(map<string, taxid_t> &id_map, string &filename);
@@ -88,7 +91,7 @@ int main(int argc, char **argv) {
   opts.deterministic_build = true;
   ParseCommandLine(argc, argv, opts);
 
-  omp_set_num_threads( opts.num_threads );
+  thread_pool pool(opts.num_threads);
 
   map<string, taxid_t> ID_to_taxon_map;
 
@@ -124,9 +127,9 @@ int main(int argc, char **argv) {
   std::cerr << "CHT created with " << bits_for_taxid << " bits reserved for taxid." << std::endl;
 
   if (opts.deterministic_build)
-    ProcessSequences(opts, ID_to_taxon_map, kraken_index, taxonomy);
+    ProcessSequences(opts, ID_to_taxon_map, kraken_index, taxonomy, pool);
   else
-    ProcessSequencesFast(opts, ID_to_taxon_map, kraken_index, taxonomy);
+    ProcessSequencesFast(opts, ID_to_taxon_map, kraken_index, taxonomy, pool);
 
   std::cerr << "Writing data to disk... " << std::flush;
   kraken_index.WriteTable(opts.hashtable_filename.c_str());
@@ -154,14 +157,15 @@ int main(int argc, char **argv) {
 
 // A quick but nondeterministic build
 void ProcessSequencesFast(const Options &opts,
-    const map<string, taxid_t> &ID_to_taxon_map,
-    CompactHashTable &kraken_index, const Taxonomy &taxonomy)
+                          const map<string, taxid_t> &ID_to_taxon_map,
+                          CompactHashTable &kraken_index, const Taxonomy &taxonomy, thread_pool& pool)
 {
-  size_t processed_seq_ct = 0;
+  std::atomic<size_t> processed_seq_ct{0};
   size_t processed_ch_ct = 0;
-
-  #pragma omp parallel
-  {
+  std::vector<std::future<void>> res;
+  std::mutex reader_mutex, status_update_mutex;
+  for (int i = 0; i < pool.size(); i++)
+    res.emplace_back(pool.submit([&] {
     Sequence sequence;
     MinimizerScanner scanner(opts.k, opts.l, opts.spaced_seed_mask,
                              ! opts.input_is_protein, opts.toggle_mask);
@@ -172,8 +176,9 @@ void ProcessSequencesFast(const Options &opts,
       // Declaration of "ok" and break need to be done outside of critical
       // section to conform with OpenMP spec.
       bool ok;
-      #pragma omp critical(reader)
+      reader_mutex.lock();
       ok = reader.LoadBlock(std::cin, opts.block_size);
+      reader_mutex.unlock();
       if (! ok)
         break;
       while (reader.NextSequence(sequence)) {
@@ -190,18 +195,19 @@ void ProcessSequencesFast(const Options &opts,
             sequence.seq.push_back('*');
           ProcessSequenceFast(sequence.seq, taxid, kraken_index, taxonomy, scanner,
             opts.min_clear_hash_value);
-          #pragma omp atomic
           processed_seq_ct++;
-          #pragma omp atomic
           processed_ch_ct += sequence.seq.size();
         }
       }
       if (isatty(fileno(stderr))) {
-        #pragma omp critical(status_update)
+        status_update_mutex.lock();
         std::cerr << "\rProcessed " << processed_seq_ct << " sequences (" << processed_ch_ct << " " << (opts.input_is_protein ? "aa" : "bp") << ")...";
+        status_update_mutex.unlock();
       }
     }
-  }
+    }));
+  for (size_t i = 0; i < res.size(); i++)
+    res[i].get();
   if (isatty(fileno(stderr)))
     std::cerr << "\r";
   std::cerr << "Completed processing of " << processed_seq_ct << " sequences, " << processed_ch_ct << " " << (opts.input_is_protein ? "aa" : "bp") << std::endl;
@@ -209,8 +215,8 @@ void ProcessSequencesFast(const Options &opts,
 
 // Slightly slower but deterministic when multithreaded
 void ProcessSequences(const Options &opts,
-    const map<string, taxid_t> &ID_to_taxon_map,
-    CompactHashTable &kraken_index, const Taxonomy &taxonomy)
+                      const map<string, taxid_t> &ID_to_taxon_map,
+                      CompactHashTable &kraken_index, const Taxonomy &taxonomy, thread_pool &pool)
 {
   size_t processed_seq_ct = 0;
   size_t processed_ch_ct = 0;
@@ -231,7 +237,7 @@ void ProcessSequences(const Options &opts,
         // Add terminator for protein sequences if not already there
         if (opts.input_is_protein && sequence.seq.back() != '*')
           sequence.seq.push_back('*');
-        ProcessSequence(opts, sequence.seq, taxid, kraken_index, taxonomy);
+        ProcessSequence(opts, sequence.seq, taxid, kraken_index, taxonomy, pool);
         processed_seq_ct++;
         processed_ch_ct += sequence.seq.size();
       }
@@ -308,12 +314,10 @@ void ProcessSequenceFast(const string &seq, taxid_t taxid,
 }
 
 void ProcessSequence(const Options &opts, const string &seq, taxid_t taxid,
-    CompactHashTable &hash, const Taxonomy &tax)
+                     CompactHashTable &hash, const Taxonomy &tax, thread_pool &pool)
 {
   const int set_ct = 256;
-  omp_lock_t locks[set_ct];
-  for (int i = 0; i < set_ct; i++)
-    omp_init_lock(&locks[i]);
+  std::mutex locks[set_ct];
   // for each block in the sequence
   for (size_t j = 0; j < seq.size(); j += opts.block_size) {
     // block: fixed length subsequence of DNA/protein, handled in series,
@@ -325,50 +329,55 @@ void ProcessSequence(const Options &opts, const string &seq, taxid_t taxid,
     std::set<uint64_t> minimizer_sets[set_ct];
 
     // for each subblock in the block, gather minimizers in parallel
-    #pragma omp parallel for schedule(dynamic)
-    for (size_t i = block_start; i < block_finish; i += opts.subblock_size) {
-      // subblock: fixed length subsequence of block, handled in parallel,
-      //   consecutive subblocks overlap by k-1 characters
-      MinimizerScanner scanner(opts.k, opts.l, opts.spaced_seed_mask,
-                               ! opts.input_is_protein, opts.toggle_mask);
-      size_t subblock_finish = i + opts.subblock_size + opts.k - 1;
-      if (subblock_finish > block_finish)
-        subblock_finish = block_finish;
-      scanner.LoadSequence(seq, i, subblock_finish);
-      uint64_t *minimizer_ptr;
-      while ((minimizer_ptr = scanner.NextMinimizer())) {
-        if (scanner.is_ambiguous())
-          continue;
-        auto hc = MurmurHash3(*minimizer_ptr);
-        // Hash-based subsampling
-        if (opts.min_clear_hash_value && hc < opts.min_clear_hash_value)
-          continue;
-        auto zone = hc % set_ct;
-        omp_set_lock(&locks[zone]);
-        minimizer_sets[zone].insert(*minimizer_ptr);
-        omp_unset_lock(&locks[zone]);
-      }
-    }  // end subblock for loop
+    pool.parallel_for(block_start, block_finish, (size_t)opts.subblock_size, [&](size_t start, size_t stop, size_t step) {
+      for (size_t i = start; i < stop; i += step) {
+        // subblock: fixed length subsequence of block, handled in parallel,
+        //   consecutive subblocks overlap by k-1 characters
+        MinimizerScanner scanner(opts.k, opts.l, opts.spaced_seed_mask,
+                                 ! opts.input_is_protein, opts.toggle_mask);
+        size_t subblock_finish = i + opts.subblock_size + opts.k - 1;
+        if (subblock_finish > block_finish)
+          subblock_finish = block_finish;
+        scanner.LoadSequence(seq, i, subblock_finish);
+        uint64_t *minimizer_ptr;
+        while ((minimizer_ptr = scanner.NextMinimizer())) {
+          if (scanner.is_ambiguous())
+            continue;
+          auto hc = MurmurHash3(*minimizer_ptr);
+          // Hash-based subsampling
+          if (opts.min_clear_hash_value && hc < opts.min_clear_hash_value)
+            continue;
+          auto zone = hc % set_ct;
+          locks[zone].lock();
+          minimizer_sets[zone].insert(*minimizer_ptr);
+          locks[zone].unlock();
+        }
+      }  // end subblock for loop
+
+    });
 
     // combine sets into sorted list
     std::vector<uint64_t> minimizer_lists[set_ct];
     size_t minimizer_list_prefix_sizes[set_ct+1] = {0};
-    #pragma omp parallel for
-    for (int i = 0; i < set_ct; i++) {
-      minimizer_lists[i].reserve(minimizer_sets[i].size());
-      for (auto &m : minimizer_sets[i])
-        minimizer_lists[i].push_back(m);
-      sort(minimizer_lists[i].begin(), minimizer_lists[i].end());
-      minimizer_list_prefix_sizes[i+1] = minimizer_lists[i].size();
-    }
+    pool.parallel_for(0, set_ct, 1, [&](int start, int stop, int step) {
+      for (int i = start; i < stop; i += step) {
+        minimizer_lists[i].reserve(minimizer_sets[i].size());
+        for (auto &m : minimizer_sets[i])
+          minimizer_lists[i].push_back(m);
+        sort(minimizer_lists[i].begin(), minimizer_lists[i].end());
+        minimizer_list_prefix_sizes[i+1] = minimizer_lists[i].size();
+      }
+    });
     for (int i = 2; i <= set_ct; i++)
       minimizer_list_prefix_sizes[i] += minimizer_list_prefix_sizes[i-1];
     std::vector<uint64_t> minimizer_list(minimizer_list_prefix_sizes[set_ct]);
-    #pragma omp parallel for
-    for (int i = 0; i < set_ct; i++) {
-      std::copy(minimizer_lists[i].begin(), minimizer_lists[i].end(),
+    pool.parallel_for(0, set_ct, 1, [&](int start, int stop, int step) {
+      for (int i = start; i < stop; i += step) {
+        std::copy(minimizer_lists[i].begin(), minimizer_lists[i].end(),
           minimizer_list.begin() + minimizer_list_prefix_sizes[i]);
     }
+
+    });
 
     size_t mm_ct = minimizer_list.size();
     std::vector<size_t> index_list(mm_ct);
@@ -378,16 +387,17 @@ void ProcessSequence(const Options &opts, const string &seq, taxid_t taxid,
     // Loop to enforce deterministic order
     while (! minimizer_list.empty()) {
       // Gather insertion point information for all remaining minimizers
-      #pragma omp parallel for
-      for (size_t i = 0; i < mm_ct; i++) {
-        // once we've determined that a minimizer won't be an insertion,
-        // don't bother calling FindIndex() again
-        if (insertion_list[i]) {
-          size_t idx;
-          insertion_list[i] = ! hash.FindIndex(minimizer_list[i], &idx);
-          index_list[i] = idx;
+      pool.parallel_for(0UL, mm_ct, 1UL, [&](size_t start, size_t stop, size_t step) {
+        for (size_t i = start; i < stop; i += step) {
+          // once we've determined that a minimizer won't be an insertion,
+          // don't bother calling FindIndex() again
+          if (insertion_list[i]) {
+            size_t idx;
+            insertion_list[i] = ! hash.FindIndex(minimizer_list[i], &idx);
+            index_list[i] = idx;
+          }
         }
-      }
+      });
 
       // Determine safe prefix of sorted set to insert in parallel
       std::set<uint64_t> novel_insertion_points;
@@ -401,10 +411,12 @@ void ProcessSequence(const Options &opts, const string &seq, taxid_t taxid,
       }
 
       // Adjust CHT values for all keys in the safe zone in parallel
-      #pragma omp parallel for
-      for (size_t i = 0; i < safe_ct; i++) {
-        SetMinimizerLCA(hash, minimizer_list[i], taxid, tax);
-      }
+      pool.parallel_for(0UL, safe_ct, 1UL, [&](size_t start, size_t stop, size_t step) {
+        for (size_t i = start; i < stop; i += step) {
+          SetMinimizerLCA(hash, minimizer_list[i], taxid, tax);
+        }
+
+      });
 
       // Remove safe prefix and re-iterate to process remainder
       minimizer_list.erase(minimizer_list.begin(), minimizer_list.begin() + safe_ct);
@@ -413,9 +425,6 @@ void ProcessSequence(const Options &opts, const string &seq, taxid_t taxid,
       mm_ct -= safe_ct;
     }  // end deterministic order while loop
   }  // end block for loop
-
-  for (int i = 0; i < set_ct; i++)
-    omp_destroy_lock(&locks[i]);
 }
 
 void ReadIDToTaxonMap(map<string, taxid_t> &id_map, string &filename) {
@@ -480,8 +489,8 @@ void ParseCommandLine(int argc, char **argv, Options &opts) {
         opts.num_threads = atoll(optarg);
         if (opts.num_threads < 1)
           errx(EX_USAGE, "can't have negative number of threads");
-        if (opts.num_threads > omp_get_max_threads())
-          errx(EX_USAGE, "OMP only wants you to use %d threads", omp_get_max_threads());
+        // if (opts.num_threads > 12)
+        //   errx(EX_USAGE, "OMP only wants you to use %d threads", 12);
         break;
       case 'H' :
         opts.hashtable_filename = optarg;

@@ -6,11 +6,13 @@
 
 #ifndef KRAKEN2_COMPACT_HASH_H_
 #define KRAKEN2_COMPACT_HASH_H_
+#include <atomic>
 
 #include "kv_store.h"
 #include "mmap_file.h"
 #include "kraken2_headers.h"
 #include "kraken2_data.h"
+#include "threadpool.h"
 
 namespace kraken2 {
 
@@ -95,7 +97,7 @@ class CompactHashTable : public KeyValueStore {
   private:
   static const size_t LOCK_ZONES = 256;
   size_t capacity_;
-  size_t size_;
+  std::atomic<size_t> size_;
   //size_t index_mask_;
   size_t key_bits_;
   size_t value_bits_;
@@ -103,7 +105,7 @@ class CompactHashTable : public KeyValueStore {
   bool file_backed_;
   bool locks_initialized_;
   MMapFile backing_file_;
-  omp_lock_t zone_locks_[LOCK_ZONES];
+  std::mutex zone_locks_[LOCK_ZONES];
 
   CompactHashTable(const CompactHashTable &rhs);
   CompactHashTable& operator=(const CompactHashTable &rhs);

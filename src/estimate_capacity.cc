@@ -9,6 +9,7 @@
 #include "mmscanner.h"
 #include "seqreader.h"
 #include "utilities.h"
+#include "threadpool.h"
 
 using std::string;
 using std::cout;
@@ -39,8 +40,9 @@ struct Options {
 void ParseCommandLine(int argc, char **argv, Options &opts);
 void usage(int exit_code = EX_USAGE);
 void ProcessSequence(string &seq, Options &opts,
-    vector<unordered_set<uint64_t>> &sets);
-void ProcessSequences(Options &opts);
+                     vector<unordered_set<uint64_t>> &sets,
+                     std::mutex &set_insert_mutex);
+void ProcessSequences(Options &opts, thread_pool &pool);
 
 int main(int argc, char **argv) {
   Options opts;
@@ -53,29 +55,33 @@ int main(int argc, char **argv) {
   opts.toggle_mask = DEFAULT_TOGGLE_MASK;
   opts.block_size = DEFAULT_BLOCK_SIZE;
   ParseCommandLine(argc, argv, opts);
-  omp_set_num_threads(opts.threads);
-  ProcessSequences(opts);
+  thread_pool pool(opts.threads);
+  ProcessSequences(opts, pool);
   return 0;
 }
 
-void ProcessSequences(Options &opts)
+void ProcessSequences(Options &opts, thread_pool &pool)
 {
   vector<unordered_set<uint64_t>> sets(opts.n);
+  vector<std::future<void>> res;
+  std::mutex batch_reading_mutex, set_insert_mutex;
+  for (int i = 0; i < pool.size(); i++)
+    res.emplace_back(pool.submit([&] {
+      bool have_work = true;
+      BatchSequenceReader reader;
+      Sequence sequence;
 
-  #pragma omp parallel
-  {
-    bool have_work = true;
-    BatchSequenceReader reader;
-    Sequence sequence;
-
-    while (have_work) {
-      #pragma omp critical(batch_reading)
-      have_work = reader.LoadBlock(std::cin, opts.block_size);
-      if (have_work)
-        while (reader.NextSequence(sequence))
-          ProcessSequence(sequence.seq, opts, sets);
-    }
-  }
+      while (have_work) {
+        batch_reading_mutex.lock();
+        have_work = reader.LoadBlock(std::cin, opts.block_size);
+        batch_reading_mutex.unlock();
+        if (have_work)
+          while (reader.NextSequence(sequence))
+            ProcessSequence(sequence.seq, opts, sets, set_insert_mutex);
+      }
+    }));
+  for (size_t i = 0; i < res.size(); i++)
+    res[i].get();
 
   size_t sum_set_sizes = 0;
   for (auto &s : sets) {
@@ -169,7 +175,8 @@ void usage(int exit_code) {
 }
 
 void ProcessSequence(string &seq, Options &opts,
-    vector<unordered_set<uint64_t>> &sets)
+                     vector<unordered_set<uint64_t>> &sets,
+                     std::mutex &set_insert_mutex)
 {
   MinimizerScanner scanner(opts.k, opts.l, opts.spaced_seed_mask, ! opts.input_is_protein, opts.toggle_mask);
   // Add terminator for protein sequences if not already there
@@ -182,8 +189,9 @@ void ProcessSequence(string &seq, Options &opts,
       continue;
     uint64_t hash_code = MurmurHash3(*minimizer_ptr);
     if ((hash_code & RANGE_MASK) < opts.n) {
-      #pragma omp critical(set_insert)
+      set_insert_mutex.lock();
       sets[hash_code & RANGE_MASK].insert(*minimizer_ptr);
+      set_insert_mutex.unlock();
     }
   }
 }

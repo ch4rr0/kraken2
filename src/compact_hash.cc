@@ -23,11 +23,9 @@ CompactHashTable::CompactHashTable(size_t capacity, size_t key_bits, size_t valu
     errx(EX_SOFTWARE, "key bits cannot be zero");
   if (value_bits == 0)
     errx(EX_SOFTWARE, "value bits cannot be zero");
-  for (size_t i = 0; i < LOCK_ZONES; i++)
-    omp_init_lock(&zone_locks_[i]);
   try {
     table_ = new CompactHashCell[capacity_];
-  } catch (std::bad_alloc ex) {
+  } catch (std::bad_alloc &ex) {
     std::cerr << "Failed attempt to allocate " << (sizeof(*table_) * capacity_) << "bytes;\n"
               << "you may not have enough free memory to build this database.\n"
               << "Perhaps increasing the k-mer length, or reducing memory usage from\n"
@@ -48,9 +46,6 @@ CompactHashTable::CompactHashTable(const char *filename, bool memory_mapping) {
 CompactHashTable::~CompactHashTable() {
   if (! file_backed_)
     delete[] table_;
-  if (locks_initialized_)
-    for (size_t i = 0; i < LOCK_ZONES; i++)
-      omp_destroy_lock(&zone_locks_[i]);
 }
 
 void CompactHashTable::LoadTable(const char *filename, bool memory_mapping) {
@@ -164,16 +159,14 @@ bool CompactHashTable::CompareAndSet
   size_t step = 0;
   while (! search_successful) {
     size_t zone = idx % LOCK_ZONES;
-    omp_set_lock(&zone_locks_[zone]);
+    zone_locks_[zone].lock();
     if (! table_[idx].value(value_bits_)
         || table_[idx].hashed_key(value_bits_) == compacted_key)
     {
       search_successful = true;
-      #pragma omp flush
       if (*old_value == table_[idx].value(value_bits_)) {
         table_[idx].populate(compacted_key, new_value, key_bits_, value_bits_);
         if (! *old_value) {
-          #pragma omp atomic
           size_++;
         }
         set_successful = true;
@@ -182,7 +175,7 @@ bool CompactHashTable::CompareAndSet
         *old_value = table_[idx].value(value_bits_);
       }
     }
-    omp_unset_lock(&zone_locks_[zone]);
+    zone_locks_[zone].unlock();
     if (step == 0)
       step = second_hash(hc);
     idx += step;
@@ -200,12 +193,10 @@ bool CompactHashTable::DirectCompareAndSet
   hkey_t compacted_key = hc >> (32 + value_bits_);
   bool set_successful = false;
   size_t zone = idx % LOCK_ZONES;
-  omp_set_lock(&zone_locks_[zone]);
-  #pragma omp flush
+  zone_locks_[zone].lock();
   if (*old_value == table_[idx].value(value_bits_)) {
     table_[idx].populate(compacted_key, new_value, key_bits_, value_bits_);
     if (! *old_value) {
-      #pragma omp atomic
       size_++;
     }
     set_successful = true;
@@ -213,7 +204,7 @@ bool CompactHashTable::DirectCompareAndSet
   else {
     *old_value = table_[idx].value(value_bits_);
   }
-  omp_unset_lock(&zone_locks_[zone]);
+  zone_locks_[zone].unlock();
   return set_successful;
 }
 
@@ -230,15 +221,18 @@ inline uint64_t CompactHashTable::second_hash(uint64_t first_hash) const {
 }
 
 taxon_counts_t CompactHashTable::GetValueCounts() const {
+  thread_pool pool(std::thread::hardware_concurrency());
   taxon_counts_t value_counts;
-  int thread_ct = omp_get_max_threads();
+  int thread_ct = pool.size();
   taxon_counts_t thread_value_counts[thread_ct];
-  #pragma omp parallel for
-  for (size_t i = 0; i < capacity_; i++) {
-    auto val = table_[i].value(value_bits_);
-    if (val)
-      thread_value_counts[omp_get_thread_num()][val]++;
+  pool.parallel_for(0UL, capacity_, 1UL, [&] (size_t start, size_t stop, size_t step) {
+    for (size_t i = start; i < stop; i += step) {
+      auto val = table_[i].value(value_bits_);
+      if (val)
+        thread_value_counts[pool.thread_id_to_int(std::this_thread::get_id())][val]++;
   }
+
+  });
   for (auto i = 0; i < thread_ct; i++) {
     for (auto &kv_pair : thread_value_counts[i])
       value_counts[kv_pair.first] += kv_pair.second;
