@@ -18,22 +18,20 @@ class threadsafe_queue {
 private:
 	mutable std::mutex mut;
 	std::queue<T> data_queue;
-	std::condition_variable data_cond;
 
 public:
 	threadsafe_queue() {}
 
-	void push(T new_value) {
+	void push(T &&new_value) {
 		std::lock_guard<std::mutex> lk(mut);
-		data_queue.push(new_value);
-		data_cond.notify_one();
+		data_queue.emplace(new_value);
 	}
 
 	bool try_pop(T& value) {
 		std::lock_guard<std::mutex> lk(mut);
 		if (data_queue.empty())
 			return false;
-		value = data_queue.front();
+		value = std::move(data_queue.front());
 		data_queue.pop();
 		return true;
 	}
@@ -51,15 +49,20 @@ class thread_pool
         std::map<std::thread::id, int> thread_id;
 	threadsafe_queue<std::function<void()>> work_queue;
 	std::vector<std::thread> threads;
+        std::condition_variable cv;
+        std::mutex m;
 
 	void worker_thread() {
 		while (!done) {
 			std::function<void()> task;
                         if (work_queue.try_pop(task)) {
 				task();
-                        } else
-                          std::this_thread::yield();
-		}
+                        } else {
+                                // std::this_thread::yield();
+                                std::unique_lock<std::mutex> lock(m);
+                                cv.wait(lock);
+                        }
+                }
 	}
 public:
 	thread_pool(int nthr):
@@ -78,6 +81,7 @@ public:
 		}
 	~thread_pool() {
 		done = true;
+                cv.notify_all();
 		for (std::thread& thread: threads) {
 			thread.join();
 		}
@@ -91,6 +95,7 @@ public:
 		auto task = std::make_shared<std::packaged_task<result_type()>>(std::bind(std::forward<Function>(f), std::forward<Args>(args)...));
 		std::future<result_type> res(task->get_future());
                 work_queue.push([task] { (*task)(); });
+                cv.notify_one();
                 return res;
 	}
 
