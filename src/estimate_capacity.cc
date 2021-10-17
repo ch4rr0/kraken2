@@ -10,6 +10,7 @@
 #include "seqreader.h"
 #include "utilities.h"
 #include "threadpool.h"
+#include "gzstream.h"
 
 using std::string;
 using std::cout;
@@ -35,6 +36,7 @@ struct Options {
   size_t block_size;
   uint64_t spaced_seed_mask;
   uint64_t toggle_mask;
+  vector<string> filenames;
 };
 
 void ParseCommandLine(int argc, char **argv, Options &opts);
@@ -64,6 +66,9 @@ void ProcessSequences(Options &opts, thread_pool &pool)
 {
   vector<unordered_set<uint64_t>> sets(opts.n);
   vector<std::future<void>> res;
+  std::istream *stream = &std::cin;
+  if (!opts.filenames.empty())
+    stream = new gzistream(&opts.filenames);
   std::mutex batch_reading_mutex, set_insert_mutex;
   for (int i = 0; i < pool.size(); i++)
     res.emplace_back(pool.submit([&] {
@@ -73,16 +78,18 @@ void ProcessSequences(Options &opts, thread_pool &pool)
 
       while (have_work) {
         batch_reading_mutex.lock();
-        have_work = reader.LoadBlock(std::cin, opts.block_size);
+        have_work = reader.LoadBlock(*stream, opts.block_size);
         batch_reading_mutex.unlock();
         if (have_work)
           while (reader.NextSequence(sequence))
             ProcessSequence(sequence.seq, opts, sets, set_insert_mutex);
       }
     }));
-  for (size_t i = 0; i < res.size(); i++)
+  for (size_t i = 0; i < res.size(); i++) {
     res[i].get();
-
+  }
+  if (!opts.filenames.empty())
+    delete stream;
   size_t sum_set_sizes = 0;
   for (auto &s : sets) {
     sum_set_sizes += s.size();
@@ -145,7 +152,13 @@ void ParseCommandLine(int argc, char **argv, Options &opts) {
         break;
     }
   }
-
+  argc -= optind;
+  argv += optind;
+  while (argc > 0) {
+    opts.filenames.push_back(*argv);
+    argv++;
+    argc--;
+  }
   if (opts.spaced_seed_mask != DEFAULT_SPACED_SEED_MASK)
     ExpandSpacedSeedMask(opts.spaced_seed_mask,
       opts.input_is_protein ? BITS_PER_CHAR_PRO : BITS_PER_CHAR_DNA);
@@ -160,7 +173,7 @@ void ParseCommandLine(int argc, char **argv, Options &opts) {
 }
 
 void usage(int exit_code) {
-  cerr << "Usage: estimate_capacity <options>" << endl
+  cerr << "Usage: estimate_capacity <options> [filenames ...]" << endl
        << endl
        << "Options (*mandatory):" << endl
        << "* -k INT        Set length of k-mers" << endl

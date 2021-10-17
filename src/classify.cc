@@ -16,6 +16,7 @@
 #include "utilities.h"
 #include "readcounts.h"
 #include "threadpool.h"
+#include "gzstream.h"
 using namespace kraken2;
 
 using std::cout;
@@ -235,10 +236,10 @@ void ProcessFiles(const char *filename1, const char *filename2,
   if (filename1 == nullptr)
     fptr1 = &std::cin;
   else {
-    fptr1 = new std::ifstream(filename1);
+    fptr1 = new gzistream(filename1);
   }
   if (opts.paired_end_processing && ! opts.single_file_pairs) {
-    fptr2 = new std::ifstream(filename2);
+    fptr2 = new gzistream(filename2);
   }
 
   // The priority queue for output is designed to ensure fragment data

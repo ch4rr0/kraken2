@@ -24,6 +24,6 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3")
 # endif(OPENMP_FOUND)
 
 find_package(Threads REQUIRED)
-set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -pthread")
+set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -lz -lpthread")
 
 add_subdirectory(src)

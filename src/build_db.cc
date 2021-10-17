@@ -13,6 +13,7 @@
 #include "kraken2_data.h"
 #include "utilities.h"
 #include "threadpool.h"
+#include "gzstream.h"
 
 using std::string;
 using std::map;
@@ -49,6 +50,7 @@ struct Options {
   uint64_t toggle_mask;
   uint64_t min_clear_hash_value;
   bool deterministic_build;
+  vector<std::string> fasta_filenames;
 };
 
 void ParseCommandLine(int argc, char **argv, Options &opts);
@@ -164,6 +166,9 @@ void ProcessSequencesFast(const Options &opts,
   size_t processed_ch_ct = 0;
   std::vector<std::future<void>> res;
   std::mutex reader_mutex, status_update_mutex;
+  std::istream *stream = &std::cin;
+  if (!opts.fasta_filenames.empty())
+    stream = new gzistream(&opts.fasta_filenames);
   for (int i = 0; i < pool.size(); i++)
     res.emplace_back(pool.submit([&] {
     Sequence sequence;
@@ -177,7 +182,7 @@ void ProcessSequencesFast(const Options &opts,
       // section to conform with OpenMP spec.
       bool ok;
       reader_mutex.lock();
-      ok = reader.LoadBlock(std::cin, opts.block_size);
+      ok = reader.LoadBlock(*stream, opts.block_size);
       reader_mutex.unlock();
       if (! ok)
         break;
@@ -211,6 +216,8 @@ void ProcessSequencesFast(const Options &opts,
   if (isatty(fileno(stderr)))
     std::cerr << "\r";
   std::cerr << "Completed processing of " << processed_seq_ct << " sequences, " << processed_ch_ct << " " << (opts.input_is_protein ? "aa" : "bp") << std::endl;
+  if (!opts.fasta_filenames.empty())
+    delete stream;
 }
 
 // Slightly slower but deterministic when multithreaded
@@ -223,8 +230,11 @@ void ProcessSequences(const Options &opts,
 
   Sequence sequence;
   BatchSequenceReader reader;
+  std::istream *stream = &std::cin;
+  if (!opts.fasta_filenames.empty())
+    stream = new gzistream(&opts.fasta_filenames);
 
-  while (reader.LoadBlock(std::cin, DEFAULT_BLOCK_SIZE)) {
+  while (reader.LoadBlock(*stream, DEFAULT_BLOCK_SIZE)) {
     while (reader.NextSequence(sequence)) {
       auto all_sequence_ids = ExtractNCBISequenceIDs(sequence.header);
       taxid_t taxid = 0;
@@ -249,6 +259,8 @@ void ProcessSequences(const Options &opts,
   if (isatty(fileno(stderr)))
     std::cerr << "\r";
   std::cerr << "Completed processing of " << processed_seq_ct << " sequences, " << processed_ch_ct << " " << (opts.input_is_protein ? "aa" : "bp") << std::endl;
+  if (!opts.fasta_filenames.empty())
+    delete stream;
 }
 
 // This function exists to deal with NCBI's use of \x01 characters to denote
@@ -547,6 +559,13 @@ void ParseCommandLine(int argc, char **argv, Options &opts) {
         break;
     }
   }
+  argc -= optind;
+  argv += optind;
+  while (argc > 0) {
+    opts.fasta_filenames.push_back(*argv);
+    argv++;
+    argc--;
+  }
 
   if (opts.spaced_seed_mask != DEFAULT_SPACED_SEED_MASK)
     ExpandSpacedSeedMask(opts.spaced_seed_mask,
@@ -579,7 +598,7 @@ void ParseCommandLine(int argc, char **argv, Options &opts) {
 }
 
 void usage(int exit_code) {
-  cerr << "Usage: build_db <options>\n"
+  cerr << "Usage: build_db <options> [fasta_filenames ...]\n"
        << "\n"
        << "Options (*mandatory):\n"
        << "* -H FILENAME   Kraken 2 hash table filename\n"
