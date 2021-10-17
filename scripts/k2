@@ -248,13 +248,13 @@ def add_to_library(args):
     library_pathname = os.path.join(args.db, "library")
     added_pathname = os.path.join(library_pathname, "added")
     os.makedirs(added_pathname, exist_ok=True)
-    #os.chdir(added_pathname)
-    with tempfile.NamedTemporaryFile(prefix="prelim_map_", suffix=".txt", dir=added_pathname, mode="w", delete=False) as out_file:
-        with open(args.file, "r") as in_file:
-            scan_fasta_file(in_file, out_file, lenient=True)
-    with tempfile.NamedTemporaryFile(suffix =".fna", dir=added_pathname, mode="w", delete=False) as out_file:
-        cp_into_temp_file(args.file, out_file.name)
-    sys.stderr.write("Added " + args.file + " to library " + args.db + "\n")
+    for filename in args.files:
+        with tempfile.NamedTemporaryFile(prefix="prelim_map_", suffix=".txt", dir=added_pathname, mode="w", delete=False) as out_file:
+            with open(filename, "r") as in_file:
+                scan_fasta_file(in_file, out_file, lenient=True)
+        with tempfile.NamedTemporaryFile(suffix =".fna", dir=added_pathname, mode="w", delete=False) as out_file:
+            cp_into_temp_file(filename, out_file.name)
+        sys.stderr.write("Added " + filename + " to library " + args.db + "\n")
 
 def make_manifest_from_assembly_summary(assembly_summary_file, is_protein = False):
     suffix = "_protein.faa.gz" if is_protein else "_genomic.fna.gz"
@@ -1126,8 +1126,8 @@ def make_add_to_library_parser(subparsers):
                                    help="Add file to library")
     parser.add_argument("--db", type=str, required=True,
                         help="Name of Kraken 2 database")
-    parser.add_argument("--file", type=str,
-                        help="Pathname of file to be added to library")
+    parser.add_argument("--file", "--files", type=str, nargs="+", dest="files",
+                        help="Pathname of file(s) to be added to library")
     parser.add_argument("--no-masking", action="store_true",
                         help="Avoid asking low-complexity sequences prior to\
                         building; masking requires dustmasker or segmasker to be\
