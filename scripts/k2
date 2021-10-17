@@ -18,6 +18,60 @@ import urllib.request
 import tempfile
 import tarfile
 
+class FTP:
+    def __init__(self, server):
+        self.ftp = ftplib.FTP(server)
+        self.ftp.login()
+
+    def _progress_bar(self, f, size_on_disk, remote_size):
+            def inner(block):
+                nonlocal size_on_disk, f, remote_size
+                f.write(block)
+                size_on_disk += len(block)
+                if size_on_disk > remote_size:
+                    size_on_disk = remote_size
+                sys.stderr.write("Downloading {:s} ... {:d}/{:d}\r".format(os.path.basename(f.name), size_on_disk, remote_size))
+            return inner
+
+    def download(self, remote_dir, filepath):
+        rest = None
+        if os.path.exists(filepath):
+            rest = os.stat(filepath).st_size
+            if rest == 0: rest = None
+        else:
+            if os.path.basename(filepath) != filepath:
+                os.makedirs(os.path.dirname(filepath), exist_ok = True)
+        self.ftp.cwd(remote_dir)
+        if rest == self.ftp.size(filepath):
+            sys.stderr.write("Skipping {:s}\n".format(get_abs_path(filepath)))
+            return
+        filename = os.path.basename(filepath)
+        with open(filepath, "ab") as f:
+            if rest != None and rest > 0:
+                f.seek(rest)
+            if rest != None:
+                sys.stderr.write("Resuming download of partial file {:s}\n".format(filepath))
+            cb = self._progress_bar(f, rest or 0, self.ftp.size(filepath))
+            self.ftp.retrbinary('RETR ' + filepath, cb, rest = f.tell())
+            sys.stderr.write("Downloaded {:s} [{:d}] to {:s}\n".format(filename, self.ftp.size(filepath), os.getcwd()))
+                # listing = io.StringIO()
+                # ftp.retrlines('LIST ' + filepath, callback = listing.write)
+                # print(listing.getvalue().split()[5:8])
+
+    def exists(self, filepath):
+        try:
+            self.ftp.size(filepath)
+        except:
+            return False
+        return True
+
+    def connect(self, server):
+        self.ftp = ftplib.FTP(server)
+        self.ftp.login()
+
+    def close(self):
+        self.ftp.quit()
+
 LIBRARY_DIR="/tmp"
 NCBI_SERVER="ftp.ncbi.nlm.nih.gov"
 FTP_SERVER="ftp://" + NCBI_SERVER
@@ -338,11 +392,20 @@ def get_manifest(server, remote_path, regex):
 
 def download_files_from_manifest(server, remote_dir, manifest_filename="manifest.txt", uncompress = False, out_filename = None):
     with open(manifest_filename, "r") as f:
+        ftp = FTP(NCBI_SERVER)
         for filename in f:
-            url = server + remote_dir + filename
-            download_from_ftp(NCBI_SERVER, remote_dir, filename.strip())
+            filename = filename.strip()
+            if not ftp.exists(remote_dir + filename):
+                sys.stderr.write("{:s} does not exist on server, skipping\n".format(remote_dir + filename))
+                continue
+            try:
+                ftp.download(remote_dir, filename)
+            except:
+                ftp.connect(NCBI_SERVER)
+                ftp.download(remote_dir, filename)
             if uncompress:
                 uncompress_file(filename.strip(), out_filename)
+        ftp.close()
 
 def download_taxonomy(args):
     taxonomy_path = os.path.join(args.db, "taxonomy")
@@ -369,7 +432,7 @@ def download_genomic_library(args):
     library_filename = "library.faa" if args.protein else "library.fna"
     library_pathname = os.path.join(args.db, "library")
 
-    if args.library in ["achaea", "bacteria", "viral", "fungi", "plant", "human", "protozoa"]:
+    if args.library in ["archaea", "bacteria", "viral", "fungi", "plant", "human", "protozoa"]:
         library_pathname = os.path.join(library_pathname, args.library)
         os.makedirs(library_pathname, exist_ok = True)
         os.chdir(library_pathname)
@@ -944,7 +1007,7 @@ def classify(args):
             "-H", os.path.join(database_path, "hash.k2d"),
             "-t", os.path.join(database_path, "taxo.k2d"),
             "-o", os.path.join(database_path, "opts.k2d")]
-    wrapper_args_binary_args(args, argv, get_binary_options(classify_bin))
+    wrapper_args_to_binary_args(args, argv, get_binary_options(classify_bin))
     argv.extend(args.filenames)
     sys.exit(subprocess.call(argv))
 
@@ -1017,6 +1080,8 @@ def make_build_parser(subparsers):
                         help="Maximum number of bytes for Kraken 2 hash table;\
                         if the estimator determines more would normally be\
                         needed, the reference library will be downsampled to fit")
+    parser.add_argument("--skip-maps", action="store_true",
+                        help="Avoids downloading accession number to taxid maps")
     parser.add_argument("--protein", action="store_true",
                         help="Build a protein database for translated search")
     parser.add_argument("--block-size", type=int, default=16384,
@@ -1161,6 +1226,9 @@ def k2_main():
     SCRIPT_PATHNAME = os.path.realpath(inspect.getsourcefile(k2_main))
 
     parser = make_cmdline_parser()
+    if (len(sys.argv) == 1):
+        parser.print_help()
+        exit(1)
     args = parser.parse_args(sys.argv[1:])
     task = sys.argv[1]
     if task not in ["classify", "inspect"]:
@@ -1175,7 +1243,7 @@ def k2_main():
         add_to_library(args)
     elif task == "build":
         if args.standard:
-            pass
+            build_standard_database(args)
         elif args.special:
             if args.special == "greengenes":
                 install_16S_gg(args)
