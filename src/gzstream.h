@@ -30,7 +30,7 @@ public:
 
 protected:
         basic_gzbuf() {
-                
+                delete[] buffer_;
         }
         virtual int_type underflow();
         // virtual basic_gzbuf *setbuf(char_type *buf, std::streamsize size);
@@ -40,7 +40,7 @@ private:
         std::streamsize size_;
         const std::vector<std::string> *filenames_;
         size_t file_idx_;
-        static const int DEFAULT_BUFSIZ = 1024;
+        static const int DEFAULT_BUFSIZ = 1024 * 1024 * 64;
         gzFile f;
 };
 
@@ -91,6 +91,7 @@ void basic_gzbuf<charT, traits>::open(const char *filename) {
                           << std::endl;
                 exit(1);
         }
+        gzbuffer(f, DEFAULT_BUFSIZ);
 }
 
 template<typename charT, typename traits>
