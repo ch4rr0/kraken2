@@ -3,75 +3,24 @@
 import argparse
 import ftplib
 import glob
-import os
-import re
-import sys
 import gzip
 import inspect
+import logging
+import os
+import re
 import shlex
-import subprocess
 import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
 import urllib
 import urllib.error
 import urllib.parse
 import urllib.request
-import tempfile
-import tarfile
 
-class FTP:
-    def __init__(self, server):
-        self.ftp = ftplib.FTP(server)
-        self.ftp.login()
-
-    def _progress_bar(self, f, size_on_disk, remote_size):
-            def inner(block):
-                nonlocal size_on_disk, f, remote_size
-                f.write(block)
-                size_on_disk += len(block)
-                if size_on_disk > remote_size:
-                    size_on_disk = remote_size
-                sys.stderr.write("Downloading {:s} ... {:d}/{:d}\r".format(os.path.basename(f.name), size_on_disk, remote_size))
-            return inner
-
-    def download(self, remote_dir, filepath):
-        rest = None
-        if os.path.exists(filepath):
-            rest = os.stat(filepath).st_size
-            if rest == 0: rest = None
-        else:
-            if os.path.basename(filepath) != filepath:
-                os.makedirs(os.path.dirname(filepath), exist_ok = True)
-        self.ftp.cwd(remote_dir)
-        if rest == self.ftp.size(filepath):
-            sys.stderr.write("Skipping {:s}\n".format(get_abs_path(filepath)))
-            return
-        filename = os.path.basename(filepath)
-        with open(filepath, "ab") as f:
-            if rest != None and rest > 0:
-                f.seek(rest)
-            if rest != None:
-                sys.stderr.write("Resuming download of partial file {:s}\n".format(filepath))
-            cb = self._progress_bar(f, rest or 0, self.ftp.size(filepath))
-            self.ftp.retrbinary('RETR ' + filepath, cb, rest = f.tell())
-            sys.stderr.write("Downloaded {:s} [{:d}] to {:s}\n".format(filename, self.ftp.size(filepath), os.getcwd()))
-                # listing = io.StringIO()
-                # ftp.retrlines('LIST ' + filepath, callback = listing.write)
-                # print(listing.getvalue().split()[5:8])
-
-    def exists(self, filepath):
-        try:
-            self.ftp.size(filepath)
-        except:
-            return False
-        return True
-
-    def connect(self, server):
-        self.ftp = ftplib.FTP(server)
-        self.ftp.login()
-
-    def close(self):
-        self.ftp.quit()
-
+SCRIPT_PATHNAME = None
+LOG = None
 LIBRARY_DIR="/tmp"
 NCBI_SERVER="ftp.ncbi.nlm.nih.gov"
 FTP_SERVER="ftp://" + NCBI_SERVER
@@ -101,7 +50,63 @@ WRAPPER_ARGS_TO_BIN_ARGS = {
     "use_mpa_style"         : "-m",
     "report_zero_counts"    : "-z",
 }
-SCRIPT_PATHNAME = None
+
+class FTP:
+    def __init__(self, server):
+        self.ftp = ftplib.FTP(server)
+        self.ftp.login()
+
+    def _progress_bar(self, f, size_on_disk, remote_size):
+            def inner(block):
+                nonlocal size_on_disk, f, remote_size
+                f.write(block)
+                size_on_disk += len(block)
+                if size_on_disk > remote_size:
+                    size_on_disk = remote_size
+                LOG.debug("Downloading {:s} ... {:d}/{:d}\r".format(os.path.basename(f.name), size_on_disk, remote_size))
+            return inner
+
+    def download(self, remote_dir, filepath):
+        rest = None
+        if os.path.exists(filepath):
+            rest = os.stat(filepath).st_size
+            if rest == 0: rest = None
+        else:
+            if os.path.basename(filepath) != filepath:
+                os.makedirs(os.path.dirname(filepath), exist_ok = True)
+        self.ftp.cwd(remote_dir)
+        if rest == self.ftp.size(filepath):
+            LOG.info("Skipping {:s}\n".format(get_abs_path(filepath)))
+            return
+        filename = os.path.basename(filepath)
+        with open(filepath, "ab") as f:
+            if rest != None and rest > 0:
+                f.seek(rest)
+            if rest != None:
+                LOG.info("Resuming download of partial file {:s}\n".format(filepath))
+            cb = self._progress_bar(f, rest or 0, self.ftp.size(filepath))
+            self.ftp.retrbinary('RETR ' + filepath, cb, rest = f.tell())
+            LOG.info("Downloaded {:s} [{:d}] to {:s}\n".format(filename, self.ftp.size(filepath), os.getcwd()))
+                # listing = io.StringIO()
+                # ftp.retrlines('LIST ' + filepath, callback = listing.write)
+                # print(listing.getvalue().split()[5:8])
+
+    def exists(self, filepath):
+        try:
+            self.ftp.size(filepath)
+        except:
+            return False
+        return True
+
+    def connect(self, server):
+        self.ftp = ftplib.FTP(server)
+        self.ftp.login()
+
+    def host():
+        return self.ftp.host
+
+    def close(self):
+        self.ftp.quit()
 
 def get_binary_options(binary_pathname):
     options = []
@@ -138,7 +143,7 @@ def find_kraken2_binary(name):
            name in os.listdir(os.path.join(project_root, 'src')):
             binary = os.path.join(project_root, os.path.join("src", name))
     if not binary:
-        sys.stderr.write("Unable to find {:s}, exiting".format(name))
+        LOG.error("Unable to find {:s}, exiting\n".format(name))
         exit(1)
     return binary
 
@@ -243,7 +248,7 @@ def cp_into_temp_file(old_file, temp_file):
 
 def add_to_library(args):
     if not os.path.isdir(args.db):
-        sys.stderr.write("Invalid database: {:s}\n".format(args.db))
+        LOG.error("Invalid database: {:s}\n".format(args.db))
         exit(1)
     library_pathname = os.path.join(args.db, "library")
     added_pathname = os.path.join(library_pathname, "added")
@@ -254,11 +259,12 @@ def add_to_library(args):
                 scan_fasta_file(in_file, out_file, lenient=True)
         with tempfile.NamedTemporaryFile(suffix =".fna", dir=added_pathname, mode="w", delete=False) as out_file:
             cp_into_temp_file(filename, out_file.name)
-        sys.stderr.write("Added " + filename + " to library " + args.db + "\n")
+        LOG.info("Added " + filename + " to library " + args.db + "\n")
 
 def make_manifest_from_assembly_summary(assembly_summary_file, is_protein = False):
     suffix = "_protein.faa.gz" if is_protein else "_genomic.fna.gz"
     manifest_to_taxid = {}
+    ftp = None
     for line in assembly_summary_file:
         if line.startswith("#"):
             continue
@@ -269,12 +275,17 @@ def make_manifest_from_assembly_summary(assembly_summary_file, is_protein = Fals
         if ftp_path == "na":
             continue
         remote_path = ftp_path + "/" + os.path.basename(ftp_path) + suffix
-        try:
-            # with urllib.request.urlopen(remote_path) as f:
-            local_path = urllib.parse.urlsplit(remote_path).path.replace("/genomes/", "")
+        url_components = urllib.parse.urlsplit(remote_path)
+        if not ftp:
+            ftp = FTP(url_components.netloc)
+        elif ftp.host != url_components.netloc:
+            ftp.close()
+            ftp = FTP(url_components.netloc)
+        if ftp.exists(url_components.path):
+            local_path = url_components.path.replace("/genomes/", "")
             manifest_to_taxid[local_path] = taxid
-        except urllib.error.URLError:
-            sys.stderr.write("{:s} does not exist on server, and will not be added to library\n".format(remote_path))
+        else:
+            LOG.warning("{:s} does not exist on server, and will not be added to library\n".format(remote_path))
             continue
     with open("manifest.txt", "w") as f:
         for k in manifest_to_taxid:
@@ -303,16 +314,15 @@ def assign_taxid_to_sequences(manifest_to_taxid, is_protein):
                     else:
                         ch_added += len(line) - 1
                     f.write(line)
-            # remove_files(in_filename)
             projects_added += 1
             out_line = progress_line(projects_added, total_projects,
                                      sequences_added, ch_added, ch)
             max_out_chars = max(len(out_line), max_out_chars)
             space_line = " " * max_out_chars
-            sys.stderr.write("\r{:s}\r{:s}".format(space_line, out_line))
-        sys.stderr.write("\nAll files processed, cleaning up extra sequence files...")
-        # remove_files("all")
-        sys.stderr.write("done\n")
+            LOG.debug("\r{:s}\r{:s}".format(space_line, out_line))
+        LOG.info("\nAll files processed, cleaning up extra sequence files...")
+        remove_files("all")
+        LOG.info("done\n")
 
 def progress_line(projects, total_projects, seqs, chars, ch):
     line = "Processed "
@@ -334,23 +344,24 @@ def progress_line(projects, total_projects, seqs, chars, ch):
         line += "{:f} {:s}".format(chars, ch)
     return line
 
-def uncompress_file(compressed_filename, out_filename=None, buf_size=1024):
+def uncompress_file(compressed_filename, out_filename=None, buf_size=8129):
     open_mode = "ab"
     if not out_filename:
         out_filename, ext = os.path.splitext(compressed_filename)
-        if os.path.exists(out_filename+"_tmp"):
-            os.remove(out_filename+"_tmp")
+        if os.path.exists(out_filename+".tmp"):
+            os.remove(out_filename+".tmp")
         open_mode = "wb"
     with gzip.open(compressed_filename) as gz:
-        with open(out_filename+"_tmp", open_mode) as f:
-            sys.stderr.write("Decompressing {:s} into {:s}...".format(os.path.join(os.getcwd(), compressed_filename), os.path.join(os.getcwd(), out_filename)))
+        with open(out_filename+".tmp", open_mode) as f:
+            LOG.info("Decompressing {:s} into {:s}...".format(os.path.join(os.getcwd(), compressed_filename), os.path.join(os.getcwd(), out_filename)))
+            # sys.stderr.flush()
             while True:
                 data = gz.read(buf_size)
                 f.write(data)
                 if data == b'':
                     break
-            sys.stderr.write("done\n")
-    os.rename(out_filename+"_tmp", out_filename)
+            LOG.info("done\n")
+    os.rename(out_filename+".tmp", out_filename)
 
 def download_log(filename):
     cur_size = 0
@@ -359,7 +370,7 @@ def download_log(filename):
         cur_size += b_sz
         if cur_size > tot:
             cur_size = tot
-        sys.stderr.write("Downloading {:s} ... {:d}/{:d}\r".format(filename, cur_size, tot))
+        LOG.debug("Downloading {:s} ... {:d}/{:d}\r".format(filename, cur_size, tot))
     return inner
 
 def download_file(url, local_name=None):
@@ -370,9 +381,9 @@ def download_file(url, local_name=None):
     urllib.request.urlretrieve(url, local_name,
                                reporthook = download_log(local_name))
     file_size = os.stat(local_name).st_size
-    sys.stderr.write("Downloaded {:s} [{:d}] to {:s}\n".format(local_name,
-                                                               file_size,
-                                                               os.getcwd()))
+    LOG.info("Downloaded {:s} [{:d}] to {:s}\n".format(local_name,
+                                                       file_size,
+                                                       os.getcwd()))
 
 def make_manifest_filter(file, regex):
     def inner(listing):
@@ -396,7 +407,7 @@ def download_files_from_manifest(server, remote_dir, manifest_filename="manifest
         for filename in f:
             filename = filename.strip()
             if not ftp.exists(remote_dir + filename):
-                sys.stderr.write("{:s} does not exist on server, skipping\n".format(remote_dir + filename))
+                LOG.warning("{:s} does not exist on server, skipping\n".format(remote_dir + filename))
                 continue
             try:
                 ftp.download(remote_dir, filename)
@@ -414,13 +425,13 @@ def download_taxonomy(args):
     if not args.skip_maps:
         if not args.protein:
             for subsection in ["gb", "wgs"]:
-                sys.stderr.write("Downloading nucleotide {:s} accession to taxon map...".format(subsection))
+                LOG.info("Downloading nucleotide {:s} accession to taxon map\n".format(subsection))
                 filename = "nucl_" + subsection + ".accession2taxid.gz"
                 download_from_ftp(NCBI_SERVER, "pub/taxonomy/accession2taxid/", filename)
         else:
-            sys.stderr.write("Downloading protein accession to taxon map\n")
+            LOG.info("Downloading protein accession to taxon map\n")
             download_from_ftp(NCBI_SERVER, "pub/taxonomy/accession2taxid", "prot.accession2taxid.gz")
-    sys.stderr.write("Downloaded accession to taxon map(s)\n")
+    LOG.info("Downloaded accession to taxon map(s)\n")
     download_from_ftp(NCBI_SERVER, "pub/taxonomy", "taxdump.tar.gz")
     for filename in glob.glob("*accession2taxid.gz"):
         uncompress_file(filename)
@@ -447,7 +458,7 @@ def download_genomic_library(args):
             url = "ftp://{:s}/genomes/refseq/{:s}/assembly_summary.txt".format(NCBI_SERVER, remote_dir_name)
             download_file(url)
         except urllib.error.URLError:
-            sys.stderr.write("Error downloading assembly summary file for {:s}, exiting".format(args.library))
+            LOG.error("Error downloading assembly summary file for {:s}, exiting\n".format(args.library))
             exit(1)
         if args.library == "human":
             with open("assembly_summary.txt", "r") as f1:
@@ -459,9 +470,9 @@ def download_genomic_library(args):
             # try:
         with open("assembly_summary.txt", "r") as f:
             filepath_to_taxid_table = make_manifest_from_assembly_summary(f, args.protein)
-            sys.stderr.write("Step 1/2: Downloading files from ftp\n")
+            LOG.info("Step 1/2: Downloading files from ftp\n")
             download_files_from_manifest(FTP_SERVER, "/genomes/")
-            sys.stderr.write("Step 2/2: Assigning taxonomic IDs to sequences\n")
+            LOG.info("Step 2/2: Assigning taxonomic IDs to sequences\n")
             assign_taxid_to_sequences(filepath_to_taxid_table, args.protein)
         with open(library_filename, "r") as in_file:
             with open("prelim_map.txt", "a") as out_file:
@@ -476,38 +487,39 @@ def download_genomic_library(args):
         library_pathname = os.path.join(library_pathname, args.library)
         os.makedirs(library_pathname, exist_ok = True)
         os.chdir(library_pathname)
-        files_to_remove = glob.glob("library.f*").extend(glob.glob("plasmid.*"))
-        sys.stderr.write("Downloading plasmid files from FTP...")
+        LOG.info("Downloading plasmid files from FTP...")
         pat = ".faa.gz" if args.protein else ".fna.gz"
         get_manifest(NCBI_SERVER, "genomes/refseq/plasmid/", pat)
         download_files_from_manifest(FTP_SERVER, "/genomes/refseq/plasmid/", uncompress = True, out_filename = library_filename)
         with open(library_filename, "r") as in_file:
             with open("prelim_map.txt", "w") as out_file:
                 scan_fasta_file(in_file, out_file)
+        files_to_remove = glob.glob("plasmid.*")
         remove_files(*files_to_remove)
-        sys.stderr.write("done\n")
+        LOG.info("done\n")
     elif args.library in ["nr", "nt"]:
         protein_lib = True if args.library == "nr" else False
         if protein_lib and not args.protein:
-            sys.stderr.write("{:s} is a protein database, and the Kraken2 database specified is nucleotide".format(args.library))
+            LOG.error("{:s} is a protein database, and the Kraken2 database specified is nucleotide".format(args.library))
             exit(1)
         library_pathname = os.path.join(library_pathname, args.library)
         os.makedirs(library_pathname, exist_ok=True)
         os.chdir(library_pathname)
         download_from_ftp(NCBI_SERVER, "blast/db/FASTA/", args.library + ".gz")
+        uncompress_file(args.library + ".gz", library_filename)
         with open(library_filename, "r") as in_file:
             with open("prelim_map.txt", "w") as out_file:
                 scan_fasta_file(in_file, out_file, lenient=True)
     elif args.library in ["UniVec", "UniVec_Core"]:
         if args.protein:
-            sys.stderr.write("{:s} is for nucleotide databases only\n".format(args.library))
+            LOG.error("{:s} is for nucleotide databases only\n".format(args.library))
             exit(1)
         library_pathname = os.path.join(library_pathname, args.library)
         os.makedirs(library_pathname, exist_ok=True)
         os.chdir(library_pathname)
         download_from_ftp(NCBI_SERVER, "pub/UniVec", args.library)
         special_taxid = 28384
-        sys.stderr.write("Adding taxonomy ID of {:d} to all sequences...".format(special_taxid))
+        LOG.info("Adding taxonomy ID of {:d} to all sequences...".format(special_taxid))
         with open(args.library, "r") as in_file:
             with open("library.fna", "w") as out_file:
                 for line in in_file:
@@ -517,7 +529,7 @@ def download_genomic_library(args):
         with open("library.fna", "r") as in_file:
             with open("prelim_map.txt", "w") as out_file:
                 scan_fasta_file(in_file, out_file)
-        sys.stderr.write("done\n")
+        LOG.info("done\n")
 
 # def get_mod_date(ftp, filename):
 def get_abs_path(filename):
@@ -530,7 +542,7 @@ def ftp_download_callback(f, size_on_disk, remote_size):
         size_on_disk += len(block)
         if size_on_disk > remote_size:
             size_on_disk = remote_size
-        sys.stderr.write("Downloading {:s} ... {:d}/{:d}\r".format(os.path.basename(f.name), size_on_disk, remote_size))
+        LOG.debug("Downloading {:s} ... {:d}/{:d}\r".format(os.path.basename(f.name), size_on_disk, remote_size))
     return inner
 
 def download_from_ftp(server, remote_dir, filepath):
@@ -545,7 +557,7 @@ def download_from_ftp(server, remote_dir, filepath):
     ftp.login()
     ftp.cwd(remote_dir)
     if rest == ftp.size(filepath):
-            sys.stderr.write("Skipping {:s}\n".format(get_abs_path(filepath)))
+            LOG.info("Skipping {:s}\n".format(get_abs_path(filepath)))
             return
     filename = os.path.basename(filepath)
     with open(filepath, "ab") as f:
@@ -553,10 +565,10 @@ def download_from_ftp(server, remote_dir, filepath):
             f.seek(rest)
         # print("local file size = {:d}".format(rest))
         if rest != None:
-            sys.stderr.write("Resuming download of partial file {:s}\n".format(filepath))
+            LOG.info("Resuming download of partial file {:s}\n".format(filepath))
         cb = ftp_download_callback(f, rest or 0, ftp.size(filepath))
         ftp.retrbinary('RETR ' + filepath, cb, rest = f.tell())
-        sys.stderr.write("Downloaded {:s} [{:d}] to {:s}\n".format(filename, ftp.size(filepath), os.getcwd()))
+        LOG.info("Downloaded {:s} [{:d}] to {:s}\n".format(filename, ftp.size(filepath), os.getcwd()))
         # listing = io.StringIO()
         # ftp.retrlines('LIST ' + filepath, callback = listing.write)
         # print(listing.getvalue().split()[5:8])
@@ -575,14 +587,14 @@ def build_kraken2_db(args):
     if not args.minimizer_len:
         args.minimizer_len = default_aa_minimizer_length if args.protein else default_nt_minimize_length
     if not os.path.isdir(get_abs_path(args.db)):
-        sys.stderr.write("Cannot find Kraken 2 database: \"{:s}\n".format(args.db))
+        LOG.error("Cannot find Kraken 2 database: \"{:s}\n".format(args.db))
         exit(1)
     os.chdir(args.db)
     if not os.path.isdir("taxonomy"):
-        sys.stderr.write("Cannot find taxonomy subdirectory in database\n")
+        LOG.error("Cannot find taxonomy subdirectory in database\n")
         exit(1)
     if not os.path.isdir("library"):
-        sys.stderr.write("Cannot find library subdirectory in database\n")
+        LOG.error("Cannot find library subdirectory in database\n")
         exit(1)
     if os.path.isdir(os.path.join("library", "added")):
         added_dirpath = os.path.join("library", "added")
@@ -594,9 +606,9 @@ def build_kraken2_db(args):
                         for line in in_file:
                             out_file.write(line)
     if os.path.isfile("seqid2taxid.map"):
-        sys.stderr.write("Sequence ID to taxonomy ID map already, skipping\n")
+        LOG.info("Sequence ID to taxonomy ID map already, skipping\n")
     else:
-        sys.stderr.write("Creating sequence ID to taxonomy ID map...")
+        LOG.info("Creating sequence ID to taxonomy ID map...")
         with open(os.path.join("taxonomy", "prelim_map.txt"), "w") as out_file:
             depth = 1
             for dirpath, dirnames, filenames in os.walk("library"):
@@ -608,7 +620,7 @@ def build_kraken2_db(args):
                 #     break
         if os.path.getsize(os.path.join("taxonomy", "prelim_map.txt")) == 0:
             os.remove(os.path.join("taxonomy", "prelim_map.txt"))
-            sys.stderr.write("No preliminary seqid/taxid mapping files found, aborting\n")
+            LOG.error("No preliminary seqid/taxid mapping files found, aborting\n")
             exit(1)
         with open(os.path.join("taxonomy", "prelim_map.txt"), "r") as in_file:
             with open("seqid2taxid.map.tmp", "w") as seqid2taxid_file:
@@ -624,19 +636,18 @@ def build_kraken2_db(args):
             if accession2taxid_filenames:
                 lookup_accession_numbers("accmap.tmp", "seqid2taxid.map.tmp", *accession2taxid_filenames)
             else:
-                sys.stderr.write("Accession to taxid map files are required to build this database.\n")
-                sys.stderr.write("Run kraken2 build --db {:s} --download-taxonomy again".format(args.db))
+                LOG.error("Accession to taxid map files are required to build this database.\n")
+                LOG.error("Run kraken2 build --db {:s} --download-taxonomy again".format(args.db))
                 exit(1)
         os.remove("accmap.tmp")
         move("seqid2taxid.map.tmp", "seqid2taxid.map")
-        sys.stderr.write("done\n")
-    sys.stderr.write("Estimating required capacity...")
+        LOG.info("done\n")
     estimate_capacity_binary = find_kraken2_binary("estimate_capacity")
     argv = [estimate_capacity_binary]
     wrapper_args_to_binary_args(args, argv, get_binary_options(estimate_capacity_binary))
     fasta_filenames = glob.glob(os.path.join("library", os.path.join("**", "*.f[an]a")), recursive=True)
     argv.extend(fasta_filenames)
-    sys.stderr.write("Estimating hash table size.\n")
+    LOG.info("Estimating hash table size.\n")
     proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
     # for filename in glob.glob(os.path.join("library", "*.f[an]a")):
     #     with open(filename, "rb") as in_file:
@@ -644,15 +655,15 @@ def build_kraken2_db(args):
     #             proc.stdin.write(line)
     estimate = proc.communicate()[0].decode()
     required_capacity = (int(estimate.strip()) + 8192) / args.load_factor
-    sys.stderr.write("Estimated hash table requirement: {:f} bytes\n".format(required_capacity * 4))
+    LOG.info("Estimated hash table requirement: {:f} bytes\n".format(required_capacity * 4))
     if args.max_db_size:
         if args.max_db_size < required_capacity * 4:
             args.max_db_size /= 4
-            sys.stderr.write("Specifiying lower maximum hash table size of {:f}".format(args.max_db_size))
+            LOG.warning("Specifiying lower maximum hash table size of {:f}".format(args.max_db_size))
     if os.path.isfile("hash.k2d"):
-        sys.stderr.write("Hash table already present, skipping build\n")
+        LOG.info("Hash table already present, skipping build\n")
     else:
-        sys.stderr.write("Building database ...")
+        LOG.info("Building database ...")
         build_db_bin = find_kraken2_binary("build_db")
         argv = [build_db_bin, "-H", "hash.k2d.tmp", "-t", "taxo.k2d.tmp",
                 "-o", "opts.k2d.tmp", "-n", "taxonomy", "-m", "seqid2taxid.map", "-c", str(required_capacity)]
@@ -666,7 +677,7 @@ def build_kraken2_db(args):
         move("hash.k2d.tmp", "hash.k2d")
         move("taxo.k2d.tmp", "taxo.k2d")
         move("opts.k2d.tmp", "opts.k2d")
-        sys.stderr.write("done\n")
+        LOG.info("done\n")
 
 def build_rdp_taxonomy(f):
     seqid_map = {}
@@ -709,7 +720,7 @@ def build_rdp_taxonomy(f):
                 node, parent_id = bfs_queue.pop()
                 match = re.search("([^;]+);([^;]+)$", node)
                 if match == None:
-                    sys.stderr.write("BFS processing encountered formatting eror, \"{:s}\"\n".format(node))
+                    LOG.error("BFS processing encountered formatting eror, \"{:s}\"\n".format(node))
                     exit(1)
                 display_name, rank = match.group(1), match.group(2)
                 if rank == "domain":
@@ -760,14 +771,14 @@ def build_silva_taxonomy(in_file):
                         parent_name = "root"
                     parent_id = id_map[parent_name] or None
                     if not parent_id:
-                        sys.stderr.write("orphan error: \"{:s}\"\n".format(line))
+                        LOG.error("orphan error: \"{:s}\"\n".format(line))
                         exit(1)
                     if rank == "domain":
                         rank = "superkingdom"
                     names_file.write("{:s}\t|\t{:s}\t|\t-\t|\tscientific name\t|\n".format(node_id, display_name))
                     nodes_file.write("{:s}\t|\t{:s}\t|\t{:s}\t|\t-\t|\n".format(node_id, str(parent_id), rank))
                 else:
-                    sys.stderr.write("strange input: \"{:s}\"\n".format(line))
+                    LOG.error("strange input: \"{:s}\"\n".format(line))
                     exit(1)
 
 def install_16S_silva(args):
@@ -948,18 +959,18 @@ def make_seqid_to_taxid_map(in_file, quiet, accession_map_files = False, library
                 target_lists.setdefault(capture, [])
                 target_lists[capture].insert(0, seqid)
         else:
-            sys.stderr.write("Unable to determine taxonomy ID for sequence {:s}\n".format(seqid))
+            LOG.error("Unable to determine taxonomy ID for sequence {:s}\n".format(seqid))
             exit(1)
         if output and not quiet:
             print(output)
     if quiet:
         if len(target_lists) == 0:
-            sys.stderr.write("External map required\n")
+            LOG.error("External map required\n")
         exit(0)
     if len(target_lists) == 0:
         exit(0)
     if not accession_map_files and library_map_filename == None:
-        sys.stderr.write("Found sequence ID without explicit taxonomy ID, but no map used\n")
+        LOG.error("Found sequence ID without explicit taxonomy ID, but no map used\n")
         exit(1)
     if library_map_file:
         with open(library_map_filename, "r") as f:
@@ -990,18 +1001,15 @@ def make_seqid_to_taxid_map(in_file, quiet, accession_map_files = False, library
 
 def classify(args):
     classify_bin = find_kraken2_binary("classify")
-    if classify_bin == None:
-        sys.stderr.write("Unable to find classify binary... exiting")
-        exit(1)
     database_path = find_database(args.db)
     if database_path == None:
-        sys.stderr.write("{:s} is not a valid database... exiting".format(args.db))
+        LOG.error("{:s} is not a valid database... exiting".format(args.db))
         exit(1)
     if "paired" in args and len(args.filenames) % 2 != 0:
-        sys.stderr.write("--paired requires an even number of file names")
+        LOG.error("--paired requires an even number of file names")
         exit(1)
     if args.confidence < 0 or args.confidence > 1:
-        sys.stderr.write("--confidence, {:f}, must be between 0 and 1 inclusive".format(args.confidence))
+        LOG.error("--confidence, {:f}, must be between 0 and 1 inclusive".format(args.confidence))
         exit(1)
     argv = [classify_bin,
             "-H", os.path.join(database_path, "hash.k2d"),
@@ -1014,11 +1022,11 @@ def classify(args):
 def inspect_db(args):
     database_pathname = find_database(args.db)
     if not database_pathname:
-        sys.stderr.write("{:s} database does not exist\n")
+        LOG.error("{:s} database does not exist\n")
         exit(1)
     for database_file in ["taxo.k2d", "hash.k2d", "opts.k2d"]:
         if not os.path.isfile(os.path.join(database_pathname, database_file)):
-            sys.stderr.write("{:s} does not exist\n".format(database_file))
+            LOG.error("{:s} does not exist\n".format(database_file))
     dump_table_bin = find_kraken2_binary("dump_table")
     argv = [dump_table_bin,
             "-H", os.path.join(database_pathname, "hash.k2d"),
@@ -1048,7 +1056,7 @@ def clean_db(args):
                 os.remove(filename)
     new_free = shutil.disk_usage(os.getcwd()).free
     freed = new_free - old_free
-    sys.stderr.write("Cleaned up {:s} of space\n".format(format_bytes(freed)))
+    LOG.info("Cleaned up {:s} of space\n".format(format_bytes(freed)))
 
 def make_build_parser(subparsers):
     parser = subparsers.add_parser("build",
@@ -1088,6 +1096,8 @@ def make_build_parser(subparsers):
                         help="Read block size")
     parser.add_argument("--sub-block-size", type=int, default=0,
                         help="Read subblock size")
+    parser.add_argument("--log", type=str, default=None,
+                        help="Specify a log file (default stderr)")
 
 def make_download_taxonomy_parser(subparsers):
     parser = subparsers.add_parser("download-taxonomy",
@@ -1102,6 +1112,9 @@ def make_download_taxonomy_parser(subparsers):
                         help="Avoid asking low-complexity sequences prior to\
                         building; masking requires dustmasker or segmasker to be\
                         installed")
+    parser.add_argument("--log", type=str, default="stderr",
+                        help="Specify a log filename (default stderr)")
+
 
 def make_download_library_parser(subparsers):
     parser = subparsers.add_parser("download-library",
@@ -1120,10 +1133,13 @@ def make_download_library_parser(subparsers):
                         help="Avoid asking low-complexity sequences prior to\
                         building; masking requires dustmasker or segmasker to be\
                         installed")
+    parser.add_argument("--log", type=str, default=None,
+                        help="Specify a log filename (default stderr)")
+
 
 def make_add_to_library_parser(subparsers):
     parser = subparsers.add_parser("add-to-library",
-                                   help="Add file to library")
+                                   help="Add file(s) to library")
     parser.add_argument("--db", type=str, required=True,
                         help="Name of Kraken 2 database")
     parser.add_argument("--file", "--files", type=str, nargs="+", dest="files",
@@ -1132,6 +1148,8 @@ def make_add_to_library_parser(subparsers):
                         help="Avoid asking low-complexity sequences prior to\
                         building; masking requires dustmasker or segmasker to be\
                         installed")
+    parser.add_argument("--log", type=str, default=None,
+                        help="Specify a log filename (default stderr)")
 
 def make_classify_parser(subparsers):
     parser = subparsers.add_parser("classify",
@@ -1221,8 +1239,27 @@ def make_cmdline_parser():
     make_clean_parser(subparsers)
     return parser
 
+def setup_logger(filename=None):
+    logging.StreamHandler.terminator = ""
+    logger = logging.getLogger("kraken2")
+    if filename:
+        logger.setLevel(logging.INFO)
+        handler = logging.FileHandler(filename)
+        formatter = logging.Formatter('%(asctime)s: %(message)s')
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+    else:
+        logger.setLevel(logging.DEBUG)
+        handler = logging.StreamHandler()
+        formatter = logging.Formatter("%(message)s")
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+    return logger
+
 def k2_main():
     global SCRIPT_PATHNAME
+    global LOG
+
     SCRIPT_PATHNAME = os.path.realpath(inspect.getsourcefile(k2_main))
 
     parser = make_cmdline_parser()
@@ -1230,6 +1267,7 @@ def k2_main():
         parser.print_help()
         exit(1)
     args = parser.parse_args(sys.argv[1:])
+    LOG = setup_logger(args.log)
     task = sys.argv[1]
     if task not in ["classify", "inspect"]:
         args.db = os.path.abspath(args.db)
