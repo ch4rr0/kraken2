@@ -58,9 +58,8 @@ class thread_pool
                         if (work_queue.try_pop(task)) {
 				task();
                         } else {
-                                // std::this_thread::yield();
                                 std::unique_lock<std::mutex> lock(m);
-                                cv.wait(lock);
+                                cv.wait(lock, [&] {return work_queue.size() != 0 || done; });
                         }
                 }
 	}
@@ -70,7 +69,7 @@ public:
 		{
 			try {
                                 for (int i = 0; i < nthreads; ++i) {
-                                        threads.push_back(
+                                        threads.emplace_back(
                                                 std::thread(&thread_pool::worker_thread, this));
                                         thread_id[threads[i].get_id()] = i;
                                 }
@@ -81,7 +80,9 @@ public:
 		}
 	~thread_pool() {
 		done = true;
+                std::unique_lock<std::mutex> lock(m);
                 cv.notify_all();
+                lock.unlock();
 		for (std::thread& thread: threads) {
 			thread.join();
 		}
@@ -95,6 +96,7 @@ public:
 		auto task = std::make_shared<std::packaged_task<result_type()>>(std::bind(std::forward<Function>(f), std::forward<Args>(args)...));
 		std::future<result_type> res(task->get_future());
                 work_queue.push([task] { (*task)(); });
+                std::unique_lock<std::mutex> lock(m);
                 cv.notify_one();
                 return res;
 	}
