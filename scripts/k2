@@ -4,8 +4,10 @@ import argparse
 import ftplib
 import glob
 import gzip
+import hashlib
 import inspect
 import logging
+import math
 import os
 import re
 import shlex
@@ -19,11 +21,13 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-SCRIPT_PATHNAME = None
 LOG = None
-LIBRARY_DIR="/tmp"
-NCBI_SERVER="ftp.ncbi.nlm.nih.gov"
-FTP_SERVER="ftp://" + NCBI_SERVER
+SCRIPT_PATHNAME = None
+
+NCBI_SERVER = "ftp.ncbi.nlm.nih.gov"
+GREENGENES_SERVER = "greengenes.microbio.me"
+SILVA_SERVER = "ftp.arb-silva.de"
+
 WRAPPER_ARGS_TO_BIN_ARGS = {
     "block_size"            : "-B",
     "classified_out"        : "-C",
@@ -53,55 +57,63 @@ WRAPPER_ARGS_TO_BIN_ARGS = {
 
 class FTP:
     def __init__(self, server):
+        print(server)
         self.ftp = ftplib.FTP(server, timeout=600)
         self.ftp.login()
         self.pwd = "/"
+        self.server = server
 
-    def _progress_bar(self, f, size_on_disk, remote_size):
-            def inner(block):
-                nonlocal size_on_disk, f, remote_size
-                f.write(block)
-                size_on_disk += len(block)
-                if size_on_disk > remote_size:
-                    size_on_disk = remote_size
-                LOG.debug("Downloading {:s} ... {:d}/{:d}\r".format(os.path.basename(f.name), size_on_disk, remote_size))
-            return inner
+    def _progress_bar(self, f, remote_size):
+        pb = ProgressBar(remote_size, f.tell())
+        def inner(block):
+            nonlocal f, remote_size, pb
+            f.write(block)
+            size_on_disk = f.tell()
+            if size_on_disk > remote_size:
+                size_on_disk = remote_size
+            pb.progress(size_on_disk)
+            LOG.debug("{:s} {: >10s}\r".format(pb.get_bar(), format_bytes(size_on_disk)))
+        return inner
 
-    def download(self, remote_dir, filepath):
-        rest = 0
+    def download(self, remote_dir, filepaths):
+        if isinstance(filepaths, str):
+            filepaths = [filepaths]
+        number_of_files = len(filepaths)
         self.cwd(remote_dir)
-        remote_size = self.size(filepath)
-        if os.path.exists(filepath):
-            rest = os.stat(filepath).st_size
-        else:
-            if os.path.basename(filepath) != filepath:
-                os.makedirs(os.path.dirname(filepath), exist_ok = True)
-        if rest == remote_size:
-            LOG.info("Skipping {:s}\n".format(get_abs_path(filepath)))
-            return
-        if rest > remote_size:
-            rest = 0
-        filename = os.path.basename(filepath)
-        with open(filepath, "ab") as f:
-            cb = self._progress_bar(f, rest, remote_size)
-            if rest > 0:
-                LOG.info("Resuming download of partial file {:s}\n".format(filepath))
-                f.seek(rest)
+        for index, filepath in enumerate(filepaths):
+            mode = "ab"
+            size = 0
+            remote_size = self.size(filepath)
+            if os.path.exists(filepath):
+                size = os.stat(filepath).st_size
             else:
-                rest=None
-            while True:
-                try:
-                    self.ftp.retrbinary('RETR ' + filepath, cb, rest=rest)
-                    break
-                except:
-                    rest = f.tell()
-                    self.reconnect()
-                    self.cwd(remote_dir)
-                    continue
-            LOG.info("Downloaded {:s} [{:d}] to {:s}\n".format(filename, remote_size, os.getcwd()))
-                # listing = io.StringIO()
-                # ftp.retrlines('LIST ' + filepath, callback = listing.write)
-                # print(listing.getvalue().split()[5:8])
+                if os.path.basename(filepath) != filepath:
+                    os.makedirs(os.path.dirname(filepath), exist_ok = True)
+            if size == remote_size:
+                LOG.info("Skipping {:s}\n".format(get_abs_path(filepath)))
+                continue
+            if size > remote_size:
+                mode = "wb"
+            filename = os.path.basename(filepath)
+            components = urllib.parse.SplitResult("", self.server, filepath, "", "")
+            url = urllib.parse.urlunsplit(components)
+            if number_of_files == 1:
+                LOG.info("Downloading {:s}\n".format(url))
+            else:
+                LOG.info("[{:d}/{:d}] Downloading {:s}\n".format(index+1, number_of_files, url))
+            with open(filepath, mode) as f:
+                while True:
+                    try:
+                        cb = self._progress_bar(f, remote_size)
+                        self.ftp.retrbinary('RETR ' + filepath, cb, rest=f.tell())
+                        break
+                    except:
+                        self.reconnect()
+                        self.cwd(remote_dir)
+                        continue
+            absolute_path = get_abs_path(filepath)
+            local_filename, local_dirname = os.path.basename(absolute_path), os.path.dirname(absolute_path)
+            LOG.info("Saved {:s} to {:s}\n".format(local_filename, local_dirname))
 
     def cwd(self, remote_pathname):
         self.ftp.cwd(remote_pathname)
@@ -144,6 +156,45 @@ class FTP:
 
     def close(self):
         self.ftp.quit()
+
+class ProgressBar:
+    def __init__(self, stop, current=0, width=30):
+        self.stop = stop
+        self.width = width
+        self.current = current
+        self.bar = list("[" + ("-" * self.width) + "]")
+        self.step = stop / self.width
+        self.last_index = self._calculate_index()
+        if (self.current > 0):
+            self.progress()
+
+    def progress(self, amount=0, relative=False):
+        if relative:
+            self.current += amount
+        else:
+            self.current = amount
+        index = self._calculate_index()
+        for i in range(self.last_index, index + 1):
+            if i == 1:
+                self.bar[i] = ">"
+            else:
+                self.bar[i-1], self.bar[i] = "=", ">"
+        self.last_index = index
+
+    def get_bar(self):
+        percentage = int(self.current / self.stop * 100)
+        return "{:3d}% {:s}".format(percentage, "".join(self.bar))
+
+    def _calculate_index(self):
+        return 1 if self.current == 0 else math.ceil(self.current / self.step)
+
+def count_lines(*filenames):
+    lines = 0
+    for fname in filenames:
+        with open(fname, "r") as f:
+            for line in f:
+                lines += 1
+    return lines
 
 def get_binary_options(binary_pathname):
     options = []
@@ -233,8 +284,20 @@ def check_seqid(seqid):
             taxid = match.group(1)
     return taxid
 
-def scan_fasta_file(in_file, out_file, lenient = False):
+def hash_file(filename):
+    md5 = hashlib.md5()
+    with open(filename, "rb") as in_file:
+        while True:
+            data = in_file.read(8192)
+            if not data:
+                break
+            md5.update(data)
+    return md5.hexdigest()
+
+def scan_fasta_file(in_file, out_file, lenient=False, hash=False):
+    md5 = hashlib.md5()
     for line in in_file:
+        md5.update(line.encode())
         if not line.startswith(">"):
             continue
         for match in re.finditer("(?:^>|\x01)(\S+)", line):
@@ -249,6 +312,7 @@ def scan_fasta_file(in_file, out_file, lenient = False):
                 out_file.write("TAXID\t{:s}\t{:s}\n".format(seqid, taxid))
             else:
                 out_file.write("ACCNUM\t{:s}\t{:s}\n".format(seqid, taxid))
+    return md5.hexdigest()
 
 def lookup_accession_numbers(lookup_list_file, out_filename,  *accession_map_files):
     target_lists = {}
@@ -292,12 +356,27 @@ def add_to_library(args):
     library_pathname = os.path.join(args.db, "library")
     added_pathname = os.path.join(library_pathname, "added")
     os.makedirs(added_pathname, exist_ok=True)
+    args.files = [os.path.abspath(f) for f in args.files]
+    os.chdir(added_pathname)
+    hashes = []
+    if os.path.exists("added.md5"):
+        with open("added.md5", "r") as in_file:
+            hashes = [line.split()[0] for line in in_file.readlines()]
     for filename in args.files:
-        with tempfile.NamedTemporaryFile(prefix="prelim_map_", suffix=".txt", dir=added_pathname, mode="w", delete=False) as out_file:
+        filehash = hash_file(filename)
+        if filehash in hashes:
+            LOG.info(filename + " already added to library\n")
+            return
+        destination = os.path.basename(filename)
+        if not destination.endswith(".fna"):
+            base = destination.rsplit(".", 1)[0]
+            destination = base + ".fna"
+        with open("prelim_map.txt", mode="a") as out_file:
             with open(filename, "r") as in_file:
                 scan_fasta_file(in_file, out_file, lenient=True)
-        with tempfile.NamedTemporaryFile(suffix =".fna", dir=added_pathname, mode="w", delete=False) as out_file:
-            cp_into_temp_file(filename, out_file.name)
+            shutil.copyfile(filename, destination)
+        with open("added.md5", "a") as out_file:
+            out_file.write(filehash + "\t" + destination + "\n")
         LOG.info("Added " + filename + " to library " + args.db + "\n")
 
 def make_manifest_from_assembly_summary(assembly_summary_file, is_protein = False):
@@ -322,6 +401,7 @@ def make_manifest_from_assembly_summary(assembly_summary_file, is_protein = Fals
     return manifest_to_taxid
 
 def assign_taxid_to_sequences(manifest_to_taxid, is_protein):
+    LOG.info("Assigning taxonomic IDs to sequences\n")
     out_filename = "library.faa" if is_protein else "library.fna"
     with open(out_filename, "wb") as f:
         projects_added = 0
@@ -349,9 +429,7 @@ def assign_taxid_to_sequences(manifest_to_taxid, is_protein):
             max_out_chars = max(len(out_line), max_out_chars)
             space_line = " " * max_out_chars
             LOG.debug("\r{:s}\r{:s}".format(space_line, out_line))
-        LOG.info("\nAll files processed, cleaning up extra sequence files...")
-        remove_files("all")
-        LOG.info("done\n")
+        LOG.info("\nFinished assigning taxonomic IDs to sequences\n")
 
 def progress_line(projects, total_projects, seqs, chars, ch):
     line = "Processed "
@@ -382,24 +460,27 @@ def uncompress_file(compressed_filename, out_filename=None, buf_size=8129):
         open_mode = "wb"
     with gzip.open(compressed_filename) as gz:
         with open(out_filename+".tmp", open_mode) as f:
-            LOG.info("Decompressing {:s} into {:s}...".format(os.path.join(os.getcwd(), compressed_filename), os.path.join(os.getcwd(), out_filename)))
-            # sys.stderr.flush()
+            LOG.info("Decompressing {:s}\n".format(os.path.join(os.getcwd(), compressed_filename)))
             while True:
                 data = gz.read(buf_size)
                 f.write(data)
                 if data == b'':
                     break
-            LOG.info("done\n")
+            LOG.info("Finished decompressing {:s}\n".format(os.path.join(os.getcwd(), compressed_filename)))
     os.rename(out_filename+".tmp", out_filename)
 
 def download_log(filename):
-    cur_size = 0
-    def inner(b, b_sz, tot):
-        nonlocal cur_size, filename
-        cur_size += b_sz
-        if cur_size > tot:
-            cur_size = tot
-        LOG.debug("Downloading {:s} ... {:d}/{:d}\r".format(filename, cur_size, tot))
+    pb = None
+    current_size = 0
+    def inner(block_number, read_size, total_size):
+        nonlocal pb, current_size
+        if not pb:
+            pb = ProgressBar(total_size)
+        current_size += read_size
+        if current_size > total_size:
+            current_size = total_size
+        pb.progress(current_size)
+        LOG.debug("{:s} {:5s}\r".format(pb.get_bar(),format_bytes(current_size)))
     return inner
 
 def download_file(url, local_name=None):
@@ -407,12 +488,11 @@ def download_file(url, local_name=None):
         local_name = urllib.parse.urlparse(url).path.split("/")[-1]
     else:
         os.makedirs(os.path.dirname(local_name), exist_ok = True)
+    LOG.info("Beginning download of {:s}\n".format(local_name))
     urllib.request.urlretrieve(url, local_name,
                                reporthook = download_log(local_name))
     file_size = os.stat(local_name).st_size
-    LOG.info("Downloaded {:s} [{:d}] to {:s}\n".format(local_name,
-                                                       file_size,
-                                                       os.getcwd()))
+    LOG.info("Saved {:s} to {:s}\n".format(local_name, os.getcwd()))
 
 def make_manifest_filter(file, regex):
     def inner(listing):
@@ -430,28 +510,27 @@ def get_manifest(server, remote_path, regex):
         ftp.retrlines('LIST', callback=make_manifest_filter(f, regex))
         ftp.close()
 
-def download_files_from_manifest(server, remote_dir, manifest_filename="manifest.txt", uncompress = False, out_filename = None, filepath_to_taxid_table=None):
+def download_files_from_manifest(server, remote_dir, manifest_filename="manifest.txt", uncompress=False, out_filename=None, filepath_to_taxid_table=None):
+    filepaths = []
     with open(manifest_filename, "r") as f:
-        ftp = FTP(NCBI_SERVER)
-        for filename in f:
-            filename = filename.strip()
-            if not ftp.exists(remote_dir + filename):
+        ftp = FTP(server)
+        for filepath in f:
+            filepath = filepath.strip()
+            if not ftp.exists(urllib.parse.urljoin(remote_dir, filepath)):
                 if filepath_to_taxid_table:
-                    del(filepath_to_taxid_table[filename])
-                LOG.warning("{:s} does not exist on server, skipping\n".format(remote_dir + filename))
+                    del(filepath_to_taxid_table[filepath])
+                LOG.warning("{:s} does not exist on server, skipping\n".format(remote_dir + filepath))
                 continue
-            try:
-                ftp.download(remote_dir, filename)
-            except ftplib.error_temp:
-                ftp.reconnect()
-                ftp.download(remote_dir, filename)
-            if uncompress:
-                uncompress_file(filename.strip(), out_filename)
+            filepaths.append(filepath)
+        ftp.download(remote_dir, filepaths)
         ftp.close()
+        if uncompress:
+            for filepath in filepaths:
+                uncompress_file(filepath, out_filename)
 
 def download_taxonomy(args):
     taxonomy_path = os.path.join(args.db, "taxonomy")
-    os.makedirs(taxonomy_path, exist_ok = True)
+    os.makedirs(taxonomy_path, exist_ok=True)
     os.chdir(taxonomy_path)
     ftp = FTP(NCBI_SERVER)
     if not args.skip_maps:
@@ -475,7 +554,7 @@ def download_taxonomy(args):
 def download_genomic_library(args):
     library_filename = "library.faa" if args.protein else "library.fna"
     library_pathname = os.path.join(args.db, "library")
-
+    LOG.info("Adding {:s} to {:s}\n".format(args.library, args.db))
     if args.library in ["archaea", "bacteria", "viral", "fungi", "plant", "human", "protozoa"]:
         library_pathname = os.path.join(library_pathname, args.library)
         os.makedirs(library_pathname, exist_ok = True)
@@ -503,33 +582,25 @@ def download_genomic_library(args):
             # try:
         with open("assembly_summary.txt", "r") as f:
             filepath_to_taxid_table = make_manifest_from_assembly_summary(f, args.protein)
-            LOG.info("Step 1/2: Downloading files from ftp\n")
-            download_files_from_manifest(FTP_SERVER, "/genomes/", filepath_to_taxid_table=filepath_to_taxid_table)
-            LOG.info("Step 2/2: Assigning taxonomic IDs to sequences\n")
+            download_files_from_manifest(NCBI_SERVER, "/genomes/", filepath_to_taxid_table=filepath_to_taxid_table)
             assign_taxid_to_sequences(filepath_to_taxid_table, args.protein)
         with open(library_filename, "r") as in_file:
             with open("prelim_map.txt", "a") as out_file:
                 scan_fasta_file(in_file, out_file)
-        # except:
-        #     sys.stderr.write("something went wrong\n")
-        #     exit(1)
-        # files_to_remove = glob.glob("library.f*")
-        files_to_remove = ["all", "manifest.txt"]
-        remove_files(*files_to_remove)
+        clean_up(["all", "manifest.txt"])
     elif args.library == "plasmid":
         library_pathname = os.path.join(library_pathname, args.library)
         os.makedirs(library_pathname, exist_ok = True)
         os.chdir(library_pathname)
-        LOG.info("Downloading plasmid files from FTP...")
         pat = ".faa.gz" if args.protein else ".fna.gz"
         get_manifest(NCBI_SERVER, "genomes/refseq/plasmid/", pat)
-        download_files_from_manifest(FTP_SERVER, "/genomes/refseq/plasmid/", uncompress = True, out_filename = library_filename)
+        download_files_from_manifest(NCBI_SERVER, "/genomes/refseq/plasmid/", uncompress=True, out_filename=library_filename)
         with open(library_filename, "r") as in_file:
             with open("prelim_map.txt", "w") as out_file:
                 scan_fasta_file(in_file, out_file)
         files_to_remove = glob.glob("plasmid.*")
-        remove_files(*files_to_remove)
-        LOG.info("done\n")
+        files_to_remove.append("manifest.txt")
+        clean_up(files_to_remove)
     elif args.library in ["nr", "nt"]:
         protein_lib = True if args.library == "nr" else False
         if protein_lib and not args.protein:
@@ -538,12 +609,12 @@ def download_genomic_library(args):
         library_pathname = os.path.join(library_pathname, args.library)
         os.makedirs(library_pathname, exist_ok=True)
         os.chdir(library_pathname)
-        download_from_ftp(NCBI_SERVER, "blast/db/FASTA/", args.library + ".gz")
-        # uncompress_file(args.library + ".gz", library_filename)
-        # with open(library_filename, "r") as in_file:
+        ftp = FTP(NCBI_SERVER)
+        ftp.download("blast/db/FASTA/", args.library + ".gz")
         with gzip.open(args.library + ".gz", mode="rt") as in_file:
             with open("prelim_map.txt", "w") as out_file:
                 scan_fasta_file(in_file, out_file, lenient=True)
+        clean_up([glob.glob("*.gz")])
     elif args.library in ["UniVec", "UniVec_Core"]:
         if args.protein:
             LOG.error("{:s} is for nucleotide databases only\n".format(args.library))
@@ -551,9 +622,10 @@ def download_genomic_library(args):
         library_pathname = os.path.join(library_pathname, args.library)
         os.makedirs(library_pathname, exist_ok=True)
         os.chdir(library_pathname)
-        download_from_ftp(NCBI_SERVER, "pub/UniVec", args.library)
+        ftp = FTP(NCBI_SERVER)
+        ftp.download("pub/UniVec", args.library)
         special_taxid = 28384
-        LOG.info("Adding taxonomy ID of {:d} to all sequences...".format(special_taxid))
+        LOG.info("Adding taxonomy ID of {:d} to all sequences\n".format(special_taxid))
         with open(args.library, "r") as in_file:
             with open("library.fna", "w") as out_file:
                 for line in in_file:
@@ -563,47 +635,10 @@ def download_genomic_library(args):
         with open("library.fna", "r") as in_file:
             with open("prelim_map.txt", "w") as out_file:
                 scan_fasta_file(in_file, out_file)
-        LOG.info("done\n")
+    LOG.info("Added {:s} to {:s}\n".format(args.library, args.db))
 
-# def get_mod_date(ftp, filename):
 def get_abs_path(filename):
     return os.path.abspath(filename)
-
-def ftp_download_callback(f, size_on_disk, remote_size):
-    def inner(block):
-        nonlocal size_on_disk, f, remote_size
-        f.write(block)
-        size_on_disk += len(block)
-        if size_on_disk > remote_size:
-            size_on_disk = remote_size
-        LOG.debug("Downloading {:s} ... {:d}/{:d}\r".format(os.path.basename(f.name), size_on_disk, remote_size))
-    return inner
-
-def download_from_ftp(server, remote_dir, filepath):
-    rest = 0
-    if os.path.exists(filepath):
-        rest = os.stat(filepath).st_size
-    else:
-        if os.path.basename(filepath) != filepath:
-            os.makedirs(os.path.dirname(filepath), exist_ok = True)
-    ftp = ftplib.FTP(server)
-    ftp.login()
-    ftp.cwd(remote_dir)
-    if rest == ftp.size(filepath):
-            LOG.info("Skipping {:s}\n".format(get_abs_path(filepath)))
-            return
-    filename = os.path.basename(filepath)
-    with open(filepath, "ab") as f:
-        if rest > 0:
-            LOG.info("Resuming download of partial file {:s}\n".format(filepath))
-            f.seek(rest)
-        cb = ftp_download_callback(f, rest or 0, ftp.size(filepath))
-        ftp.retrbinary('RETR ' + filepath, cb, rest = f.tell())
-        LOG.info("Downloaded {:s} [{:d}] to {:s}\n".format(filename, ftp.size(filepath), os.getcwd()))
-        # listing = io.StringIO()
-        # ftp.retrlines('LIST ' + filepath, callback = listing.write)
-        # print(listing.getvalue().split()[5:8])
-    ftp.quit()
 
 def build_kraken2_db(args):
     default_aa_minimizer_length = 12
@@ -639,16 +674,13 @@ def build_kraken2_db(args):
     if os.path.isfile("seqid2taxid.map"):
         LOG.info("Sequence ID to taxonomy ID map already, skipping\n")
     else:
-        LOG.info("Creating sequence ID to taxonomy ID map...")
+        LOG.info("Creating sequence ID to taxonomy ID map\n")
         with open(os.path.join("taxonomy", "prelim_map.txt"), "w") as out_file:
             depth = 1
             for dirpath, dirnames, filenames in os.walk("library"):
                 if "prelim_map.txt" in filenames:
                     for line in open(os.path.join(os.path.abspath(dirpath), "prelim_map.txt"), "r"):
                         out_file.write(line)
-                #     depth += 1
-                # if depth > 2:
-                #     break
         if os.path.getsize(os.path.join("taxonomy", "prelim_map.txt")) == 0:
             os.remove(os.path.join("taxonomy", "prelim_map.txt"))
             LOG.error("No preliminary seqid/taxid mapping files found, aborting\n")
@@ -672,13 +704,13 @@ def build_kraken2_db(args):
                 exit(1)
         os.remove("accmap.tmp")
         move("seqid2taxid.map.tmp", "seqid2taxid.map")
-        LOG.info("done\n")
+        LOG.info("Created sequence ID to taxonomy ID map\n")
     estimate_capacity_binary = find_kraken2_binary("estimate_capacity")
     argv = [estimate_capacity_binary]
     wrapper_args_to_binary_args(args, argv, get_binary_options(estimate_capacity_binary))
     fasta_filenames = glob.glob(os.path.join("library", os.path.join("**", "*.f[an]a")), recursive=True)
     argv.extend(fasta_filenames)
-    LOG.info("Estimating hash table size.\n")
+    LOG.info("Estimating hash table size\n")
     proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
     # for filename in glob.glob(os.path.join("library", "*.f[an]a")):
     #     with open(filename, "rb") as in_file:
@@ -686,7 +718,7 @@ def build_kraken2_db(args):
     #             proc.stdin.write(line)
     estimate = proc.communicate()[0].decode()
     required_capacity = (int(estimate.strip()) + 8192) / args.load_factor
-    LOG.info("Estimated hash table requirement: {:f} bytes\n".format(required_capacity * 4))
+    LOG.info("Estimated hash table requirement: {:s}\n".format(format_bytes(required_capacity * 4)))
     if args.max_db_size:
         if args.max_db_size < required_capacity * 4:
             args.max_db_size /= 4
@@ -694,17 +726,34 @@ def build_kraken2_db(args):
     if os.path.isfile("hash.k2d"):
         LOG.info("Hash table already present, skipping build\n")
     else:
-        LOG.info("Building database ...")
+        LOG.info("Starting database build\n")
         build_db_bin = find_kraken2_binary("build_db")
         argv = [build_db_bin, "-H", "hash.k2d.tmp", "-t", "taxo.k2d.tmp",
                 "-o", "opts.k2d.tmp", "-n", "taxonomy", "-m", "seqid2taxid.map", "-c", str(required_capacity)]
         wrapper_args_to_binary_args(args, argv, get_binary_options(build_db_bin))
         argv.extend(fasta_filenames)
-        r = subprocess.call(argv)
+        LOG.info("Running: " + " ".join(argv) + "\n")
+        # r = subprocess.call(argv)
+        filenames = ["seqid2taxid.map"]
+        if os.path.exists("unmapped.txt"):
+            filenames.append("unmapped.txt")
+        total_sequences = count_lines(*filenames)
+        pb = ProgressBar(total_sequences)
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        buf = []
+        for line in proc.stderr:
+            match = re.search("^Processed (\d+).+\.\.\.$", line)
+            if match:
+                sequences_processed = int(match.group(1))
+                pb.progress(sequences_processed)
+                LOG.debug("{:s} {:>{width}d} sequence(s) processed\r".format(pb.get_bar(), sequences_processed, width=len(str(total_sequences))))
+            else:
+                LOG.info(line)
         # for filename in glob.glob(os.path.join("library", "*.f[an]a")):
         #     with open(filename, "rb") as in_file:
         #         for line in in_file:
         #             proc.stdin.write(line)
+        proc.wait()
         move("hash.k2d.tmp", "hash.k2d")
         move("taxo.k2d.tmp", "taxo.k2d")
         move("opts.k2d.tmp", "opts.k2d")
@@ -818,14 +867,14 @@ def install_16S_silva(args):
     for directory in ["data", "taxonomy", "library"]:
         os.makedirs(directory, exist_ok=True)
     os.chdir("data")
-    ftp_server = "ftp.arb-silva.de"
-    remote_directory = "release_138_1/Exports"
+    remote_directory = "/release_138_1/Exports"
     fasta_filename = "SILVA_138.1_SSURef_NR99_tax_silva.fasta.gz"
     taxonomy_prefix = "tax_slv_ssu_138.1"
-    download_from_ftp(ftp_server, remote_directory, fasta_filename)
-    download_from_ftp(ftp_server, remote_directory + "/taxonomy", taxonomy_prefix + ".acc_taxid.gz")
+    ftp = FTP(SILVA_SERVER)
+    ftp.download(remote_directory, fasta_filename)
+    ftp.download(remote_directory + "/taxonomy", taxonomy_prefix + ".acc_taxid.gz")
     uncompress_file(taxonomy_prefix + ".acc_taxid.gz")
-    download_from_ftp(ftp_server, remote_directory + "/taxonomy", taxonomy_prefix + ".txt.gz")
+    ftp.download(remote_directory + "/taxonomy", taxonomy_prefix + ".txt.gz")
     with gzip.open(taxonomy_prefix + ".txt.gz", "rt") as f:
         build_silva_taxonomy(f)
     os.chdir(os.path.pardir)
@@ -917,16 +966,16 @@ def build_gg_taxonomy(in_file):
 
 def install_16S_gg(args):
     os.makedirs(args.db, exist_ok = True)
-    ftp_server = "greengenes.microbio.me"
     gg_version = "gg_13_5"
-    remote_directory = "greengenes_release/" + gg_version
+    remote_directory = "/greengenes_release/" + gg_version
     os.chdir(args.db)
     for directory in ["data", "taxonomy", "library"]:
         os.makedirs(directory, exist_ok = True)
     os.chdir("data")
-    download_from_ftp(ftp_server, remote_directory, gg_version + ".fasta.gz")
+    ftp = FTP(GREENGENES_SERVER)
+    ftp.download(remote_directory, gg_version + ".fasta.gz")
     uncompress_file(gg_version + ".fasta.gz")
-    download_from_ftp(ftp_server, remote_directory, gg_version + "_taxonomy.txt.gz")
+    ftp.download(remote_directory, gg_version + "_taxonomy.txt.gz")
     uncompress_file(gg_version + "_taxonomy.txt.gz")
     with open(gg_version + "_taxonomy.txt", "r") as f:
         build_gg_taxonomy(f)
@@ -986,7 +1035,7 @@ def make_seqid_to_taxid_map(in_file, quiet, accession_map_files = False, library
             output = seqid + "\t" + seqid + "\n"
         elif index in [2, 3]:
             if not quiet:
-                capture = match_group(1)
+                capture = match.group(1)
                 target_lists.setdefault(capture, [])
                 target_lists[capture].insert(0, seqid)
         else:
@@ -1067,27 +1116,26 @@ def inspect_db(args):
     exit(subprocess.call(argv))
 
 def format_bytes(size):
-    prefix = "B"
-    for p in ["kB", "MB", "GB", "TB", "PB", "EB"]:
+    current_suffix = "B"
+    for suffix in ["kB", "MB", "GB", "TB", "PB", "EB"]:
         if size >= 1024:
-            prefix = p
+            current_suffix = suffix
             size /= 1024
         else:
             break
-    return "{:.2f} {:s}".format(size, prefix)
+    return "{:.2f}{:s}".format(size, current_suffix)
+
+def clean_up(filenames):
+    LOG.info("Removing extra files\n")
+    disk_usage_before = shutil.disk_usage(os.getcwd()).free
+    remove_files(*filenames)
+    disk_usage_after = shutil.disk_usage(os.getcwd()).free
+    freed = disk_usage_after - disk_usage_before
+    LOG.info("Cleaned up {:s} of space\n".format(format_bytes(freed)))
 
 def clean_db(args):
     os.chdir(args.db)
-    old_free = shutil.disk_usage(os.getcwd()).free
-    for filename in ["library", "taxonomy", "seqid2taxid.map"]:
-        if os.path.exists(filename):
-            if os.path.isdir(filename):
-                shutil.rmtree(filename)
-            else:
-                os.remove(filename)
-    new_free = shutil.disk_usage(os.getcwd()).free
-    freed = new_free - old_free
-    LOG.info("Cleaned up {:s} of space\n".format(format_bytes(freed)))
+    clean_up(["library", "taxonomy", "seqid2taxid.map"])
 
 def make_build_parser(subparsers):
     parser = subparsers.add_parser("build",
