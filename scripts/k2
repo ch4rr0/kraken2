@@ -57,7 +57,6 @@ WRAPPER_ARGS_TO_BIN_ARGS = {
 
 class FTP:
     def __init__(self, server):
-        print(server)
         self.ftp = ftplib.FTP(server, timeout=600)
         self.ftp.login()
         self.pwd = "/"
@@ -90,12 +89,12 @@ class FTP:
                 if os.path.basename(filepath) != filepath:
                     os.makedirs(os.path.dirname(filepath), exist_ok = True)
             if size == remote_size:
-                LOG.info("Skipping {:s}\n".format(get_abs_path(filepath)))
+                LOG.info("Already downloaded {:s}\n".format(get_abs_path(filepath)))
                 continue
             if size > remote_size:
                 mode = "wb"
             filename = os.path.basename(filepath)
-            components = urllib.parse.SplitResult("", self.server, filepath, "", "")
+            components = urllib.parse.SplitResult("ftp", self.server, filepath, "", "")
             url = urllib.parse.urlunsplit(components)
             if number_of_files == 1:
                 LOG.info("Downloading {:s}\n".format(url))
@@ -196,6 +195,15 @@ def count_lines(*filenames):
                 lines += 1
     return lines
 
+def dwk2():
+    estimate_capacity = find_kraken2_binary("estimate_capacity")
+    output = subprocess.check_output([estimate_capacity, "-h"],
+                                     stderr=subprocess.STDOUT)
+    for line in output.split(b'\n'):
+        if line.startswith(b"Usage:"):
+            return True if line.strip().endswith(b"<options>") else False
+    return False
+
 def get_binary_options(binary_pathname):
     options = []
     proc = subprocess.Popen(binary_pathname, stderr=subprocess.PIPE)
@@ -284,20 +292,18 @@ def check_seqid(seqid):
             taxid = match.group(1)
     return taxid
 
-def hash_file(filename):
+def hash_file(filename, buf_size=8192):
     md5 = hashlib.md5()
     with open(filename, "rb") as in_file:
         while True:
-            data = in_file.read(8192)
+            data = in_file.read(buf_size)
             if not data:
                 break
             md5.update(data)
     return md5.hexdigest()
 
 def scan_fasta_file(in_file, out_file, lenient=False, hash=False):
-    md5 = hashlib.md5()
     for line in in_file:
-        md5.update(line.encode())
         if not line.startswith(">"):
             continue
         for match in re.finditer("(?:^>|\x01)(\S+)", line):
@@ -312,7 +318,6 @@ def scan_fasta_file(in_file, out_file, lenient=False, hash=False):
                 out_file.write("TAXID\t{:s}\t{:s}\n".format(seqid, taxid))
             else:
                 out_file.write("ACCNUM\t{:s}\t{:s}\n".format(seqid, taxid))
-    return md5.hexdigest()
 
 def lookup_accession_numbers(lookup_list_file, out_filename,  *accession_map_files):
     target_lists = {}
@@ -451,23 +456,38 @@ def progress_line(projects, total_projects, seqs, chars, ch):
         line += "{:f} {:s}".format(chars, ch)
     return line
 
-def uncompress_file(compressed_filename, out_filename=None, buf_size=8129):
-    open_mode = "ab"
-    if not out_filename:
-        out_filename, ext = os.path.splitext(compressed_filename)
-        if os.path.exists(out_filename+".tmp"):
-            os.remove(out_filename+".tmp")
-        open_mode = "wb"
-    with gzip.open(compressed_filename) as gz:
-        with open(out_filename+".tmp", open_mode) as f:
-            LOG.info("Decompressing {:s}\n".format(os.path.join(os.getcwd(), compressed_filename)))
-            while True:
-                data = gz.read(buf_size)
-                f.write(data)
-                if data == b'':
-                    break
-            LOG.info("Finished decompressing {:s}\n".format(os.path.join(os.getcwd(), compressed_filename)))
-    os.rename(out_filename+".tmp", out_filename)
+def uncompress_files(compressed_filenames, out_filename=None, buf_size=8192):
+    if out_filename:
+        if os.path.exists(out_filename):
+            LOG.info("{:s} already successfully decompressed, skipping".format(out_filename))
+        else:
+            with open(out_filename + ".tmp", "ab") as out_file:
+                for filename in compressed_filenames:
+                    with gzip.open(filename) as gz:
+                        uncompress_file(gz, out_file)
+                os.rename(out_filename + ".tmp", out_filename)
+    else:
+        for filename in compressed_filenames:
+            out_filename, ext = os.path.splitext(filename)
+            if os.path.exists(out_filename):
+                LOG.info("{:s} already successfully decompressed, skipping\n".format(filename))
+                continue
+            if os.path.exists(out_filename + ".tmp"):
+                os.remove(out_filename + ".tmp")
+            with gzip.open(filename) as gz:
+                with open(out_filename + ".tmp", "wb") as out:
+                    uncompress_file(gz, out, buf_size)
+            os.rename(out_filename + ".tmp", out_filename)
+    remove_files(*compressed_filenames)
+
+def uncompress_file(in_file, out_file, buf_size=8129):
+    LOG.info("Decompressing {:s}\n".format(os.path.join(os.getcwd(), in_file.name)))
+    while True:
+        data = in_file.read(buf_size)
+        out_file.write(data)
+        if data == b'':
+            break
+    LOG.info("Finished decompressing {:s}\n".format(os.path.join(os.getcwd(), in_file.name)))
 
 def download_log(filename):
     pb = None
@@ -525,8 +545,7 @@ def download_files_from_manifest(server, remote_dir, manifest_filename="manifest
         ftp.download(remote_dir, filepaths)
         ftp.close()
         if uncompress:
-            for filepath in filepaths:
-                uncompress_file(filepath, out_filename)
+            uncompress_files(filepaths, out_filename)
 
 def download_taxonomy(args):
     taxonomy_path = os.path.join(args.db, "taxonomy")
@@ -545,8 +564,7 @@ def download_taxonomy(args):
     LOG.info("Downloaded accession to taxon map(s)\n")
     ftp.download("/pub/taxonomy", "taxdump.tar.gz")
     ftp.close()
-    for filename in glob.glob("*accession2taxid.gz"):
-        uncompress_file(filename)
+    uncompress_files(glob.glob("*accession2taxid.gz"))
     with tarfile.open("taxdump.tar.gz", "r:gz") as tar:
         tar.extractall()
     # TODO: delete files
@@ -672,7 +690,7 @@ def build_kraken2_db(args):
                         for line in in_file:
                             out_file.write(line)
     if os.path.isfile("seqid2taxid.map"):
-        LOG.info("Sequence ID to taxonomy ID map already, skipping\n")
+        LOG.info("Sequence ID to taxonomy ID map already present, skipping\n")
     else:
         LOG.info("Creating sequence ID to taxonomy ID map\n")
         with open(os.path.join("taxonomy", "prelim_map.txt"), "w") as out_file:
@@ -709,13 +727,18 @@ def build_kraken2_db(args):
     argv = [estimate_capacity_binary]
     wrapper_args_to_binary_args(args, argv, get_binary_options(estimate_capacity_binary))
     fasta_filenames = glob.glob(os.path.join("library", os.path.join("**", "*.f[an]a")), recursive=True)
-    argv.extend(fasta_filenames)
+    if not dwk2():
+        argv.extend(fasta_filenames)
     LOG.info("Estimating hash table size\n")
     proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
-    # for filename in glob.glob(os.path.join("library", "*.f[an]a")):
-    #     with open(filename, "rb") as in_file:
-    #         for line in in_file:
-    #             proc.stdin.write(line)
+    if dwk2():
+        for filename in fasta_filenames:
+            with open(filename, "rb") as in_file:
+                while True:
+                    data = in_file.read(8192)
+                    if not data:
+                        break
+                    proc.stdin.write(data)
     estimate = proc.communicate()[0].decode()
     required_capacity = (int(estimate.strip()) + 8192) / args.load_factor
     LOG.info("Estimated hash table requirement: {:s}\n".format(format_bytes(required_capacity * 4)))
@@ -731,33 +754,42 @@ def build_kraken2_db(args):
         argv = [build_db_bin, "-H", "hash.k2d.tmp", "-t", "taxo.k2d.tmp",
                 "-o", "opts.k2d.tmp", "-n", "taxonomy", "-m", "seqid2taxid.map", "-c", str(required_capacity)]
         wrapper_args_to_binary_args(args, argv, get_binary_options(build_db_bin))
-        argv.extend(fasta_filenames)
         LOG.info("Running: " + " ".join(argv) + "\n")
-        # r = subprocess.call(argv)
-        filenames = ["seqid2taxid.map"]
-        if os.path.exists("unmapped.txt"):
-            filenames.append("unmapped.txt")
-        total_sequences = count_lines(*filenames)
-        pb = ProgressBar(total_sequences)
-        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
-        buf = []
-        for line in proc.stderr:
-            match = re.search("^Processed (\d+).+\.\.\.$", line)
-            if match:
-                sequences_processed = int(match.group(1))
-                pb.progress(sequences_processed)
-                LOG.debug("{:s} {:>{width}d} sequence(s) processed\r".format(pb.get_bar(), sequences_processed, width=len(str(total_sequences))))
-            else:
-                LOG.info(line)
-        # for filename in glob.glob(os.path.join("library", "*.f[an]a")):
-        #     with open(filename, "rb") as in_file:
-        #         for line in in_file:
-        #             proc.stdin.write(line)
-        proc.wait()
+        if not dwk2():
+            argv.extend(fasta_filenames)
+            filenames = ["seqid2taxid.map"]
+            if os.path.exists("unmapped.txt"):
+                filenames.append("unmapped.txt")
+            total_sequences = count_lines(*filenames)
+            pb = ProgressBar(total_sequences)
+            proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+            buf = []
+            for line in proc.stderr:
+                match = re.search("^Processed (\d+).+\.\.\.$", line)
+                if match:
+                    sequences_processed = int(match.group(1))
+                    pb.progress(sequences_processed)
+                    LOG.debug("{:s} {:>{width}d} sequence(s) processed\r".format(pb.get_bar(), sequences_processed, width=len(str(total_sequences))))
+                else:
+                    LOG.info(line)
+            proc.wait()
+        else:
+            proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            for filename in fasta_filenames:
+               LOG.info("Starting to process {:s}\n".format(filename))
+               with open(filename, "rb") as in_file:
+                    while True:
+                        data = in_file.read(8192)
+                        if not data:
+                            break
+                        proc.stdin.write(data)
+                    # sys.stderr.writelines(proc.stderr.readlines())
+            proc.stdin.close()
+            proc.wait()
         move("hash.k2d.tmp", "hash.k2d")
         move("taxo.k2d.tmp", "taxo.k2d")
         move("opts.k2d.tmp", "opts.k2d")
-        LOG.info("done\n")
+        LOG.info("Finished building database\n")
 
 def build_rdp_taxonomy(f):
     seqid_map = {}
@@ -873,7 +905,7 @@ def install_16S_silva(args):
     ftp = FTP(SILVA_SERVER)
     ftp.download(remote_directory, fasta_filename)
     ftp.download(remote_directory + "/taxonomy", taxonomy_prefix + ".acc_taxid.gz")
-    uncompress_file(taxonomy_prefix + ".acc_taxid.gz")
+    uncompress_files([taxonomy_prefix + ".acc_taxid.gz"])
     ftp.download(remote_directory + "/taxonomy", taxonomy_prefix + ".txt.gz")
     with gzip.open(taxonomy_prefix + ".txt.gz", "rt") as f:
         build_silva_taxonomy(f)
@@ -974,9 +1006,9 @@ def install_16S_gg(args):
     os.chdir("data")
     ftp = FTP(GREENGENES_SERVER)
     ftp.download(remote_directory, gg_version + ".fasta.gz")
-    uncompress_file(gg_version + ".fasta.gz")
+    uncompress_files([gg_version + ".fasta.gz"])
     ftp.download(remote_directory, gg_version + "_taxonomy.txt.gz")
-    uncompress_file(gg_version + "_taxonomy.txt.gz")
+    uncompress_files([gg_version + "_taxonomy.txt.gz"])
     with open(gg_version + "_taxonomy.txt", "r") as f:
         build_gg_taxonomy(f)
     os.chdir(os.path.abspath(os.path.pardir))
@@ -995,9 +1027,7 @@ def install_16S_rdp(args):
     os.chdir("data")
     download_file("http://rdp.cme.msu.edu/download/current_Bacteria_unaligned.fa.gz")
     download_file("http://rdp.cme.msu.edu/download/current_Archaea_unaligned.fa.gz")
-    for gz_file in glob.glob("*.gz"):
-        uncompress_file(gz_file)
-        os.remove(gz_file)
+    uncompress_files(glob.glob("*gz"))
     for filename in glob.glob("current_*_unaligned.fa"):
         with open(filename, "r") as f:
             build_rdp_taxonomy(f)
@@ -1171,7 +1201,7 @@ def make_build_parser(subparsers):
                         help="Avoids downloading accession number to taxid maps")
     parser.add_argument("--protein", action="store_true",
                         help="Build a protein database for translated search")
-    parser.add_argument("--block-size", type=int, default=30 * 1024 * 1024,
+    parser.add_argument("--block-size", type=int, default=16384,
                         help="Read block size")
     parser.add_argument("--sub-block-size", type=int, default=0,
                         help="Read subblock size")
