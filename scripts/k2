@@ -373,9 +373,10 @@ def add_to_library(args):
             LOG.info(filename + " already added to library\n")
             return
         destination = os.path.basename(filename)
-        if not destination.endswith(".fna"):
+        ext = ".fna" if args.protein else "faa"
+        if not destination.endswith(ext):
             base = destination.rsplit(".", 1)[0]
-            destination = base + ".fna"
+            destination = base + ext
         with open("prelim_map.txt", mode="a") as out_file:
             with open(filename, "r") as in_file:
                 scan_fasta_file(in_file, out_file, lenient=True)
@@ -729,7 +730,7 @@ def build_kraken2_db(args):
     fasta_filenames = glob.glob(os.path.join("library", os.path.join("**", "*.f[an]a")), recursive=True)
     if not dwk2():
         argv.extend(fasta_filenames)
-    LOG.info("Estimating hash table size\n")
+    LOG.info("Running: " + " ".join(argv) + "\n")
     proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
     if dwk2():
         for filename in fasta_filenames:
@@ -754,7 +755,6 @@ def build_kraken2_db(args):
         argv = [build_db_bin, "-H", "hash.k2d.tmp", "-t", "taxo.k2d.tmp",
                 "-o", "opts.k2d.tmp", "-n", "taxonomy", "-m", "seqid2taxid.map", "-c", str(required_capacity)]
         wrapper_args_to_binary_args(args, argv, get_binary_options(build_db_bin))
-        LOG.info("Running: " + " ".join(argv) + "\n")
         if not dwk2():
             argv.extend(fasta_filenames)
             filenames = ["seqid2taxid.map"]
@@ -762,6 +762,7 @@ def build_kraken2_db(args):
                 filenames.append("unmapped.txt")
             total_sequences = count_lines(*filenames)
             pb = ProgressBar(total_sequences)
+            LOG.info("Running: " + " ".join(argv) + "\n")
             proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
             buf = []
             for line in proc.stderr:
@@ -774,6 +775,7 @@ def build_kraken2_db(args):
                     LOG.info(line)
             proc.wait()
         else:
+            LOG.info("Running: " + " ".join(argv) + "\n")
             proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             for filename in fasta_filenames:
                LOG.info("Starting to process {:s}\n".format(filename))
@@ -1171,7 +1173,7 @@ def make_build_parser(subparsers):
     parser = subparsers.add_parser("build",
                                    help="Create DB from library\
                                    (requires taxonomy downloaded and at least one file\
-                                   in library")
+                                   in library)")
     parser.add_argument("--db", type=str, required=True,
                         help="Name of Kraken 2 database")
     mutex_group = parser.add_mutually_exclusive_group()
@@ -1206,7 +1208,7 @@ def make_build_parser(subparsers):
     parser.add_argument("--sub-block-size", type=int, default=0,
                         help="Read subblock size")
     parser.add_argument("--log", type=str, default=None,
-                        help="Specify a log file (default stderr)")
+                        help="Specify a log file (default: stderr)")
 
 def make_download_taxonomy_parser(subparsers):
     parser = subparsers.add_parser("download-taxonomy",
@@ -1222,7 +1224,7 @@ def make_download_taxonomy_parser(subparsers):
                         building; masking requires dustmasker or segmasker to be\
                         installed")
     parser.add_argument("--log", type=str, default=None,
-                        help="Specify a log filename (default stderr)")
+                        help="Specify a log filename (default: stderr)")
 
 
 def make_download_library_parser(subparsers):
@@ -1253,12 +1255,14 @@ def make_add_to_library_parser(subparsers):
                         help="Name of Kraken 2 database")
     parser.add_argument("--file", "--files", type=str, nargs="+", dest="files",
                         help="Pathname of file(s) to be added to library")
+    parser.add_argument("--protein", action="store_true",
+                        help="Files being added are for a protein database")
     parser.add_argument("--no-masking", action="store_true",
                         help="Avoid asking low-complexity sequences prior to\
                         building; masking requires dustmasker or segmasker to be\
                         installed")
     parser.add_argument("--log", type=str, default=None,
-                        help="Specify a log filename (default stderr)")
+                        help="Specify a log filename (default: stderr)")
 
 def make_classify_parser(subparsers):
     parser = subparsers.add_parser("classify",
@@ -1336,8 +1340,18 @@ def make_clean_parser(subparsers):
     parser.add_argument("--db", type=str, required=True,
                         help="Name of Kraken2 DB")
 
+class HelpAction(argparse._HelpAction):
+    def __call__(self, parser, namespace, values, option_string=None):
+        parser.print_help()
+        subparsers = parser._actions[1].choices
+        for action, parser in subparsers.items():
+            sys.stderr.write("\n\n" + action + "\n" + "-" * len(action) + "\n")
+            parser.print_help()
+        exit(0)
+
 def make_cmdline_parser():
-    parser = argparse.ArgumentParser("kraken2")
+    parser = argparse.ArgumentParser("kraken2", add_help=False)
+    parser.add_argument("--help", action=HelpAction)
     subparsers = parser.add_subparsers()
     make_add_to_library_parser(subparsers)
     make_download_library_parser(subparsers)
