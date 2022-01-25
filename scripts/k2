@@ -1232,7 +1232,7 @@ def make_download_library_parser(subparsers):
                                    help="Download and build a special database")
     parser.add_argument("--db", type=str, required=True,
                         help="Name of Kraken 2 database")
-    parser.add_argument("--library", type=str,
+    parser.add_argument("--library", type=str, required=True,
                         choices=["archaea", "bacteria", "plasmid",
                                  "viral", "human", "fungi", "plant",
                                  "protozoa", "nr", "nt", "UniVec", "UniVec_Core"],
