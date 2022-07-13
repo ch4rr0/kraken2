@@ -18,14 +18,14 @@ MMapFile::MMapFile() {
 }
 
 void MMapFile::OpenFile(const string &filename_str, int mode, int prot_flags,
-  int map_flags, size_t size)
+                        int map_flags, size_t size)
 {
   const char *filename = filename_str.c_str();
   OpenFile(filename, mode, map_flags, prot_flags, size);
 }
 
 void MMapFile::OpenFile(const char *filename, int mode, int prot_flags,
-  int map_flags, size_t size)
+                        int map_flags, size_t size)
 {
   if (mode & O_APPEND || (mode & O_ACCMODE) == O_WRONLY)
     errx(EX_SOFTWARE, "illegal mode passed to MMapFile");
@@ -57,6 +57,9 @@ void MMapFile::OpenFile(const char *filename, int mode, int prot_flags,
   fptr_ = (char *) mmap(0, filesize_, prot_flags, map_flags, fd_, 0);
   if (fptr_ == MAP_FAILED) {
     err(EX_OSERR, "unable to mmap %s", filename);
+  }
+  if (madvise(fptr_, filesize_, MADV_RANDOM) == -1) {
+    errx(EX_OSERR, "unable to madvise %s", filename);
   }
   valid_ = true;
 }
@@ -97,7 +100,7 @@ void MMapFile::LoadFile() {
   // #endif
 }
 
-char * MMapFile::fptr() {
+void * MMapFile::fptr() {
   return valid_ ? fptr_ : NULL;
 }
 

@@ -17,8 +17,6 @@
 
 using std::string;
 using std::map;
-using std::cout;
-using std::queue;
 using std::cerr;
 using std::endl;
 using std::vector;
@@ -51,6 +49,7 @@ struct Options {
   uint64_t min_clear_hash_value;
   bool deterministic_build;
   vector<std::string> fasta_filenames;
+  bool memory_mapped;
 };
 
 void ParseCommandLine(int argc, char **argv, Options &opts);
@@ -91,6 +90,7 @@ int main(int argc, char **argv) {
   opts.min_clear_hash_value = 0;
   opts.maximum_capacity = 0;
   opts.deterministic_build = true;
+  opts.memory_mapped = false;
   ParseCommandLine(argc, argv, opts);
 
   thread_pool pool(opts.num_threads);
@@ -125,7 +125,7 @@ int main(int argc, char **argv) {
   }
 
   CompactHashTable kraken_index(actual_capacity, 32 - bits_for_taxid,
-      bits_for_taxid);
+                                bits_for_taxid, opts.memory_mapped);
   std::cerr << "CHT created with " << bits_for_taxid << " bits reserved for taxid." << std::endl;
 
   if (opts.deterministic_build)
@@ -204,11 +204,10 @@ void ProcessSequencesFast(const Options &opts,
           processed_ch_ct += sequence.seq.size();
         }
       }
-      if (isatty(fileno(stderr))) {
-        status_update_mutex.lock();
-        std::cerr << "\rProcessed " << processed_seq_ct << " sequences (" << processed_ch_ct << " " << (opts.input_is_protein ? "aa" : "bp") << ")...";
-        status_update_mutex.unlock();
-      }
+      status_update_mutex.lock();
+      std::cerr << "\rProcessed " << processed_seq_ct << " sequences (" << processed_ch_ct << " " << (opts.input_is_protein ? "aa" : "bp") << ")...";
+      std::cerr << (isatty(fileno(stderr)) ? "\r" : "\n");
+      status_update_mutex.unlock();
     }
     }));
   for (size_t i = 0; i < res.size(); i++)
@@ -252,12 +251,9 @@ void ProcessSequences(const Options &opts,
         processed_ch_ct += sequence.seq.size();
       }
     }
-    if (isatty(fileno(stderr))) {
-      std::cerr << "\rProcessed " << processed_seq_ct << " sequences (" << processed_ch_ct << " " << (opts.input_is_protein ? "aa" : "bp") << ")...";
-    }
+    std::cerr << "Processed " << processed_seq_ct << " sequences (" << processed_ch_ct << " " << (opts.input_is_protein ? "aa" : "bp") << ")...";
+    std::cerr << (isatty(fileno(stderr)) ? "\r" : "\n");
   }
-  if (isatty(fileno(stderr)))
-    std::cerr << "\r";
   std::cerr << "Completed processing of " << processed_seq_ct << " sequences, " << processed_ch_ct << " " << (opts.input_is_protein ? "aa" : "bp") << std::endl;
   if (!opts.fasta_filenames.empty())
     delete stream;
@@ -472,7 +468,7 @@ void ParseCommandLine(int argc, char **argv, Options &opts) {
   int opt;
   long long sig;
 
-  while ((opt = getopt(argc, argv, "?hB:b:c:FH:m:n:o:t:k:l:M:p:r:s:S:T:X")) != -1) {
+  while ((opt = getopt(argc, argv, "?hB:b:c:FH:m:n:o:t:k:l:M:p:r:Rs:S:T:X")) != -1) {
     switch (opt) {
       case 'h' : case '?' :
         usage(0);
@@ -556,6 +552,9 @@ void ParseCommandLine(int argc, char **argv, Options &opts) {
         break;
       case 'X' :
         opts.input_is_protein = true;
+        break;
+      case 'R' :
+        opts.memory_mapped = true;
         break;
     }
   }

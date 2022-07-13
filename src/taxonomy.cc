@@ -196,7 +196,7 @@ void Taxonomy::Init(const char *filename, bool memory_mapping) {
   if (memory_mapping) {
     taxonomy_data_file_.OpenFile(filename);
     file_backed_ = true;
-    char *ptr = taxonomy_data_file_.fptr();
+    char *ptr = (char *)taxonomy_data_file_.fptr();
     if (strncmp(FILE_MAGIC, ptr, strlen(FILE_MAGIC)) != 0) {
       errx(EX_DATAERR,
           "attempt to load taxonomy from malformed file %s", filename);

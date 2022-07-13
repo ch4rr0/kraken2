@@ -18,7 +18,7 @@ namespace kraken2 {
     void OpenFile(const std::string &filename, int mode = O_RDONLY, int map_flags = -1, int prot_flags = -1, size_t size = 0);
     void OpenFile(const char *filename, int mode = O_RDONLY, int map_flags = -1, int prot_flags = -1, size_t size = 0);
 
-    char *fptr();
+    void *fptr();
     size_t filesize();
 
     void LoadFile();
@@ -31,7 +31,7 @@ namespace kraken2 {
 
     bool valid_;
     int fd_;
-    char *fptr_;
+    void *fptr_;
     size_t filesize_;
   };
 }

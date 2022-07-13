@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import asyncio
 import ftplib
 import glob
 import gzip
@@ -9,6 +10,7 @@ import inspect
 import logging
 import math
 import os
+import pathlib
 import re
 import shlex
 import shutil
@@ -34,8 +36,10 @@ WRAPPER_ARGS_TO_BIN_ARGS = {
     "confidence"            : "-T",
     "fast_build"            : "-F",
     "kmer_len"              : "-k",
-    "memory_mapping"        : "-M",
+    # "memory_mapping"        : "-M",
+    "memory_mapping"        : "-R",
     "minimizer_len"         : "-l",
+    "minimum_bits_for_taxid": "-r",
     "mininum_base_quality"  : "-Q",
     "mininum_hit_groups"    : "-g",
     "output"                : "-O",
@@ -45,14 +49,14 @@ WRAPPER_ARGS_TO_BIN_ARGS = {
     "report"                : "-R",
     "report_minimizer_data" : "-K",
     "report_zero_counts"    : "-z",
+    "report_zero_counts"    : "-z",
+    "skip_counts"           : "-s",
     "sub_block_size"        : "-b",
     "threads"               : "-p",
     "unclassified_out"      : "-U",
     "use_mpa_style"         : "-m",
-    "use_names"             : "-n",
-    "skip_counts"           : "-s",
     "use_mpa_style"         : "-m",
-    "report_zero_counts"    : "-z",
+    "use_names"             : "-n",
 }
 
 class FTP:
@@ -215,6 +219,15 @@ def get_binary_options(binary_pathname):
         options.append(match.group(1).decode())
     return options
 
+def construct_seed_template(args):
+    if int(args.minimizer_len / 4) < args.minimizer_spaces:
+        LOG.error("Number of minimizer spaces {} exceeds max for minimizer len {}; max {}\n".format(args.minimizer_spaces,
+                                                                                                    args.minimizer_len,
+                                                                                                    int(args.minimizer_len/4)))
+        exit(1)
+    return "1" * (args.minimizer_len - 2 * args.minimizer_spaces) + \
+        "01" * args.minimizer_spaces
+
 def wrapper_args_to_binary_args(opts, argv, binary_args):
     for k, v in vars(opts).items():
         if k not in WRAPPER_ARGS_TO_BIN_ARGS:
@@ -353,6 +366,37 @@ def lookup_accession_numbers(lookup_list_file, out_filename,  *accession_map_fil
 
 def cp_into_temp_file(old_file, temp_file):
     shutil.copy(old_file, temp_file)
+
+async def mask_low_complexity_regions(filename, protein=False):
+    # masker = "segmasker" if protein else "dustmasker"
+    # argv = [masker, "-i", filename]
+    argv = "head -n 100 " + filename
+    proc = await asyncio.create_subprocess_shell(argv, stdout=subprocess.PIPE)
+    # await asyncio.sleep(random.randint(1, 10))
+    while True:
+        data = await proc.stdout.readline()
+        if not data:
+            break
+        if re.match(b"^a", data):
+            print(data)
+        else:
+            print(re.sub(b"[A-Za-z]", b"x", data))
+
+async def gather(pathnames, protein=False):
+    task_list = []
+    for pathname in pathnames:
+        task_list.append(
+            asyncio.create_task(mask_low_complexity_regions(pathname, protein)))
+    await asyncio.gather(*task_list)
+
+def mask(args):
+    if not os.path.isdir(args.db):
+        LOG.error("Invalid database: {:s}\n".format(args.db))
+        exit(1)
+    library_filename = "library.faa" if args.protein else "library.fna"
+    library_pathnames = pathlib.PurePath(args.db).joinpath("library", "**", library_filename)
+    library_pathnames = glob.glob(str(library_pathnames))
+    asyncio.run(gather(library_pathnames))
 
 def add_to_library(args):
     if not os.path.isdir(args.db):
@@ -598,7 +642,6 @@ def download_genomic_library(args):
                         if line.find("Genome Reference Consortium"):
                             f2.write(line)
             os.rename("grc.txt", "assembly_summary.txt")
-            # try:
         with open("assembly_summary.txt", "r") as f:
             filepath_to_taxid_table = make_manifest_from_assembly_summary(f, args.protein)
             download_files_from_manifest(NCBI_SERVER, "/genomes/", filepath_to_taxid_table=filepath_to_taxid_table)
@@ -660,17 +703,6 @@ def get_abs_path(filename):
     return os.path.abspath(filename)
 
 def build_kraken2_db(args):
-    default_aa_minimizer_length = 12
-    default_aa_kmer_length = 15
-    default_aa_minimizer_spaces = 0
-    default_nt_minimize_length = 31
-    default_nt_kmer_length = 35
-    default_nt_minimizer_spaces = 35
-
-    if not args.kmer_len:
-        args.kmer_len = default_aa_kmer_length if args.protein else default_nt_kmer_length
-    if not args.minimizer_len:
-        args.minimizer_len = default_aa_minimizer_length if args.protein else default_nt_minimize_length
     if not os.path.isdir(get_abs_path(args.db)):
         LOG.error("Cannot find Kraken 2 database: \"{:s}\n".format(args.db))
         exit(1)
@@ -725,7 +757,9 @@ def build_kraken2_db(args):
         move("seqid2taxid.map.tmp", "seqid2taxid.map")
         LOG.info("Created sequence ID to taxonomy ID map\n")
     estimate_capacity_binary = find_kraken2_binary("estimate_capacity")
-    argv = [estimate_capacity_binary]
+    argv = [estimate_capacity_binary, "-S", construct_seed_template(args)]
+    if args.protein:
+        argv.append("-X")
     wrapper_args_to_binary_args(args, argv, get_binary_options(estimate_capacity_binary))
     fasta_filenames = glob.glob(os.path.join("library", os.path.join("**", "*.f[an]a")), recursive=True)
     if not dwk2():
@@ -745,15 +779,17 @@ def build_kraken2_db(args):
     LOG.info("Estimated hash table requirement: {:s}\n".format(format_bytes(required_capacity * 4)))
     if args.max_db_size:
         if args.max_db_size < required_capacity * 4:
-            args.max_db_size /= 4
-            LOG.warning("Specifiying lower maximum hash table size of {:f}".format(args.max_db_size))
+            args.max_db_size = int(args.max_db_size / 4)
+            LOG.warning("Specifiying lower maximum hash table size of {:f}\n".format(args.max_db_size))
     if os.path.isfile("hash.k2d"):
         LOG.info("Hash table already present, skipping build\n")
     else:
         LOG.info("Starting database build\n")
         build_db_bin = find_kraken2_binary("build_db")
         argv = [build_db_bin, "-H", "hash.k2d.tmp", "-t", "taxo.k2d.tmp",
-                "-o", "opts.k2d.tmp", "-n", "taxonomy", "-m", "seqid2taxid.map", "-c", str(required_capacity)]
+                "-o", "opts.k2d.tmp", "-n", "taxonomy", "-m", "seqid2taxid.map", "-c", str(required_capacity), "-S", construct_seed_template(args)]
+        if args.protein:
+            argv.append("-X")
         wrapper_args_to_binary_args(args, argv, get_binary_options(build_db_bin))
         if not dwk2():
             argv.extend(fasta_filenames)
@@ -1186,6 +1222,9 @@ def make_build_parser(subparsers):
                         help="K-mer length in bp/aa")
     parser.add_argument("--minimizer-len", type=int,
                         help="Minimizer length in bp/aa")
+    parser.add_argument("--minimizer-spaces", type=int,
+                        help="Number of characters in minimizer that are\
+                        ignored in comparisons")
     parser.add_argument("--threads", type=int,
                         default=os.environ.get("KRAKEN2_NUM_THREADS") or 1,
                         help="Number of threads")
@@ -1207,6 +1246,27 @@ def make_build_parser(subparsers):
                         help="Read block size")
     parser.add_argument("--sub-block-size", type=int, default=0,
                         help="Read subblock size")
+    parser.add_argument("--memory-mapping", action='store_true',
+                        default=argparse.SUPPRESS,
+                        help="Use memory-mapped I/O for building index. This\
+                        allows for building indexes larger than available RAM,\
+                        but at the cost of speed.")
+    parser.add_argument("--minimum-bits-for-taxid", type=int,
+                        default=0, help="Bit storage requested for taxid")
+    parser.add_argument("--log", type=str, default=None,
+                        help="Specify a log file (default: stderr)")
+
+def make_mask_parser(subparsers):
+    parser = subparsers.add_parser("mask",
+                               help="Mask low complexity regions in library files\
+                               ; masking requires dustmasker and segmasker to be\
+                               installed")
+    parser.add_argument("--db", type=str, required=True,
+                        help="Name of Kraken 2 database")
+    parser.add_argument("--libraries", type=str, nargs="+",
+                        help="The libraries that need to be masked")
+    parser.add_argument("--protein", action="store_true",
+                        help="Files being masked are for a protein database")
     parser.add_argument("--log", type=str, default=None,
                         help="Specify a log file (default: stderr)")
 
@@ -1215,17 +1275,12 @@ def make_download_taxonomy_parser(subparsers):
                                    help="Download NCBI taxonomic information")
     parser.add_argument("--db", type=str, required=True,
                         help="Name of Kraken 2 database")
+    parser.add_argument("--protein", action="store_true",
+                        help="Files being added are for a protein database")
     parser.add_argument("--skip-maps", action="store_true",
                         help="Avoids downloading accession number to taxid maps")
-    parser.add_argument("--protein", action="store_true",
-                        help="Build a protein database for translated search")
-    parser.add_argument("--no-masking", action="store_true",
-                        help="Avoid asking low-complexity sequences prior to\
-                        building; masking requires dustmasker or segmasker to be\
-                        installed")
     parser.add_argument("--log", type=str, default=None,
                         help="Specify a log filename (default: stderr)")
-
 
 def make_download_library_parser(subparsers):
     parser = subparsers.add_parser("download-library",
@@ -1236,10 +1291,9 @@ def make_download_library_parser(subparsers):
                         choices=["archaea", "bacteria", "plasmid",
                                  "viral", "human", "fungi", "plant",
                                  "protozoa", "nr", "nt", "UniVec", "UniVec_Core"],
-                        help="Name of library to download"
-)
+                        help="Name of library to download")
     parser.add_argument("--protein", action="store_true",
-                        help="Build a protein database for translated search")
+                        help="Files being added are for a protein database")
     parser.add_argument("--no-masking", action="store_true",
                         help="Avoid asking low-complexity sequences prior to\
                         building; masking requires dustmasker or segmasker to be\
@@ -1304,7 +1358,7 @@ def make_classify_parser(subparsers):
                         default=argparse.SUPPRESS,
                         help="With --report, report minimizer and distinct minimizer\
                         count information in addition to normal Kraken report")
-    parser.add_argument("--memory-mapping", action='store_true',
+    parser.add_argument("--c-memory-mapping", action='store_true',
                         default=argparse.SUPPRESS,
                         help="Avoids loading database into RAM")
     parser.add_argument("--paired", action='store_true',
@@ -1333,6 +1387,8 @@ def make_inspect_parser(subparsers):
                         help="Format output like Kraken 1's kraken-mpa-report")
     parser.add_argument("--report-zero-counts", action="store_true",
                         help="Report counts for ALL taxa, even if counts are zero")
+    parser.add_argument("--log", type=str, default=None,
+                        help="Specify a log filename (default: stderr)")
 
 def make_clean_parser(subparsers):
     parser = subparsers.add_parser("clean",
@@ -1354,6 +1410,7 @@ def make_cmdline_parser():
     parser.add_argument("--help", action=HelpAction)
     subparsers = parser.add_subparsers()
     make_add_to_library_parser(subparsers)
+    make_mask_parser(subparsers)
     make_download_library_parser(subparsers)
     make_download_taxonomy_parser(subparsers)
     make_build_parser(subparsers)
@@ -1402,7 +1459,37 @@ def k2_main():
         download_genomic_library(args)
     elif task == "add-to-library":
         add_to_library(args)
+    elif task == "inspect":
+        inspect_db(args)
+    elif task == "clean":
+        clean_db(args)
+    elif task == "mask":
+        mask(args)
     elif task == "build":
+        default_aa_minimizer_length = 12
+        default_aa_kmer_length = 15
+        default_aa_minimizer_spaces = 0
+        default_nt_minimizer_length = 31
+        default_nt_kmer_length = 35
+        default_nt_minimizer_spaces = 7
+
+        if args.sub_block_size == 0:
+            args.sub_block_size = math.ceil(args.block_size / args.threads)
+        if not args.kmer_len:
+            args.kmer_len = default_aa_kmer_length if args.protein else default_nt_kmer_length
+        if not args.minimizer_len:
+            args.minimizer_len = default_aa_minimizer_length if args.protein else default_nt_minimizer_length
+        if not args.minimizer_spaces:
+            args.minimizer_spaces = default_aa_minimizer_spaces if args.protein else default_nt_minimizer_spaces
+        if args.minimizer_len > args.kmer_len:
+            LOG.error("Minimizer length ({}) must not be greater than kmer length {}\n".format(args.minimizer_len, args.kmer_len))
+            exit(1)
+        if args.load_factor <= 0 or args.load_factor > 1:
+            LOG.error("Load factor must be greater than 0 but no more than 1\n")
+            exit(1)
+        if args.minimizer_len <= 0 or args.minimizer_len > 31:
+            LOG.error("Minimizer length must be a positive integer and cannot exceed 31\n")
+            exit(1)
         if args.standard:
             build_standard_database(args)
         elif args.special:
@@ -1414,10 +1501,6 @@ def k2_main():
                 install_16S_rdp(args)
         else:
             build_kraken2_db(args)
-    elif task == "inspect":
-        inspect_db(args)
-    elif task == "clean":
-        clean_db(args)
 
 if __name__ == '__main__':
     k2_main()

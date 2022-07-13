@@ -12,7 +12,7 @@ using std::unordered_map;
 
 namespace kraken2 {
 
-CompactHashTable::CompactHashTable(size_t capacity, size_t key_bits, size_t value_bits)
+  CompactHashTable::CompactHashTable(size_t capacity, size_t key_bits, size_t value_bits, bool memory_mapped)
     : capacity_(capacity), size_(0), key_bits_(key_bits), value_bits_(value_bits),
       file_backed_(false), locks_initialized_(true)
 {
@@ -24,13 +24,19 @@ CompactHashTable::CompactHashTable(size_t capacity, size_t key_bits, size_t valu
   if (value_bits == 0)
     errx(EX_SOFTWARE, "value bits cannot be zero");
   try {
-    table_ = new CompactHashCell[capacity_];
+    if (!memory_mapped)
+      table_ = new CompactHashCell[capacity_];
+    else {
+      backing_file_.OpenFile("hash.mmap", O_RDWR | O_CREAT | O_TRUNC, PROT_READ | PROT_WRITE, MAP_SHARED, sizeof(CompactHashCell) * capacity_ + 4 * sizeof(size_t));
+      file_backed_ = true;
+      table_ = (CompactHashCell *)((char *)backing_file_.fptr() + (4 * sizeof(size_t)));
+    }
   } catch (std::bad_alloc &ex) {
     std::cerr << "Failed attempt to allocate " << (sizeof(*table_) * capacity_) << "bytes;\n"
               << "you may not have enough free memory to build this database.\n"
-              << "Perhaps increasing the k-mer length, or reducing memory usage from\n"
-              << "other programs could help you build this database?" << std::endl;
-    errx(EX_OSERR, "unable to allocate hash table memory");
+              << "Perhaps increasing the k-mer length, or adding the `--mmap` flag,\n"
+              << "or reducing memory usage from other programs could help you build this database?"
+              << std::endl;
   }
   memset(table_, 0, capacity_ * sizeof(*table_));
 }
@@ -52,7 +58,7 @@ void CompactHashTable::LoadTable(const char *filename, bool memory_mapping) {
   locks_initialized_ = false;
   if (memory_mapping) {
     backing_file_.OpenFile(filename);
-    char *ptr = backing_file_.fptr();
+    char *ptr = (char *)backing_file_.fptr();
     memcpy((char *) &capacity_, ptr, sizeof(capacity_));
     ptr += sizeof(capacity_);
     memcpy((char *) &size_, ptr, sizeof(size_));
@@ -62,7 +68,7 @@ void CompactHashTable::LoadTable(const char *filename, bool memory_mapping) {
     memcpy((char *) &value_bits_, ptr, sizeof(value_bits_));
     ptr += sizeof(value_bits_);
     table_ = (CompactHashCell *) ptr;
-    if (backing_file_.filesize() - (ptr - backing_file_.fptr()) !=
+    if (backing_file_.filesize() - (ptr - (char *)backing_file_.fptr()) !=
         sizeof(*table_) * capacity_)
     {
       errx(EX_DATAERR, "Capacity mismatch in %s, aborting", filename);
@@ -92,13 +98,24 @@ void CompactHashTable::LoadTable(const char *filename, bool memory_mapping) {
 }
 
 void CompactHashTable::WriteTable(const char *filename) {
-  ofstream ofs(filename, ofstream::binary);
-  ofs.write((char *) &capacity_, sizeof(capacity_));
-  ofs.write((char *) &size_, sizeof(size_));
-  ofs.write((char *) &key_bits_, sizeof(key_bits_));
-  ofs.write((char *) &value_bits_, sizeof(value_bits_));
-  ofs.write((char *) table_, sizeof(*table_) * capacity_);
-  ofs.close();
+  if (file_backed_) {
+    size_t *header = (size_t *)backing_file_.fptr();
+    header[0] = capacity_;
+    header[1] = size_;
+    header[2] = key_bits_;
+    header[3] = value_bits_;
+    backing_file_.CloseFile();
+    std::cerr << "I got here" << std::endl;
+    rename("hash.mmap", filename);
+  } else {
+    ofstream ofs(filename, ofstream::binary);
+    ofs.write((char *) &capacity_, sizeof(capacity_));
+    ofs.write((char *) &size_, sizeof(size_));
+    ofs.write((char *) &key_bits_, sizeof(key_bits_));
+    ofs.write((char *) &value_bits_, sizeof(value_bits_));
+    ofs.write((char *) table_, sizeof(*table_) * capacity_);
+    ofs.close();
+  }
 }
 
 hvalue_t CompactHashTable::Get(hkey_t key) const {
@@ -146,8 +163,6 @@ bool CompactHashTable::FindIndex(hkey_t key, size_t *idx) const {
 bool CompactHashTable::CompareAndSet
     (hkey_t key, hvalue_t new_value, hvalue_t *old_value)
 {
-  if (file_backed_)
-    return false;
   if (new_value == 0)
     return false;
   uint64_t hc = MurmurHash3(key);

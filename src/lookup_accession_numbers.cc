@@ -38,14 +38,14 @@ int main(int argc, char **argv) {
     if (target_lists.empty())  // Stop processing files if we've found all we need
       break;
     accmap_file.OpenFile(argv[i]);
-    char *ptr = accmap_file.fptr();
+    char *ptr = (char *)accmap_file.fptr();
     // Skip header line
     char *lf_ptr = (char *) memchr(ptr, '\n', accmap_file.filesize());
     if (lf_ptr != nullptr)
       ptr = lf_ptr + 1;
 
-    while ((size_t)(ptr - accmap_file.fptr()) < accmap_file.filesize()) {
-      lf_ptr = (char *) memchr(ptr, '\n', accmap_file.filesize() - (ptr - accmap_file.fptr()));
+    while ((size_t)(ptr - (char *)accmap_file.fptr()) < accmap_file.filesize()) {
+            lf_ptr = (char *) memchr(ptr, '\n', accmap_file.filesize() - (ptr - (char *)accmap_file.fptr()));
       if (lf_ptr == nullptr) {
         warnx("expected EOL not found at EOF in %s", argv[i]);
         break;
