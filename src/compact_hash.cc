@@ -105,7 +105,6 @@ void CompactHashTable::WriteTable(const char *filename) {
     header[2] = key_bits_;
     header[3] = value_bits_;
     backing_file_.CloseFile();
-    std::cerr << "I got here" << std::endl;
     rename("hash.mmap", filename);
   } else {
     ofstream ofs(filename, ofstream::binary);
