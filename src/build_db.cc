@@ -616,6 +616,7 @@ void usage(int exit_code) {
        << "  -F            Use fast, nondeterministic building method\n"
        << "  -B INT        Read block size\n"
        << "  -b INT        Read subblock size\n"
-       << "  -r INT        Bit storage requested for taxid" << endl;
+       << "  -r INT        Bit storage requested for taxid\n"
+       << "  -R            Use memory-mapped I/O" << endl;
   exit(exit_code);
 }
